@@ -285,6 +285,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     const result = await productivityReviewService(db).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
+      // Shrink the resolved-review snooze below the 8h-old seed so this test
+      // exercises the creation cap in isolation from the snooze window.
+      thresholds: { resolvedSnoozeMs: 60 * 60 * 1000 },
     });
 
     expect(result.created).toBe(0);
@@ -433,7 +436,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     const result = await productivityReviewService(db).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { maxConsecutiveNoActionReviews: 1 },
+      // The middle review's updatedAt is 7h old; keep the snooze below that so
+      // this test exercises the no-action streak ordering, not the snooze window.
+      thresholds: { maxConsecutiveNoActionReviews: 1, resolvedSnoozeMs: 6 * 60 * 60 * 1000 },
     });
 
     expect(result.created).toBe(0);
@@ -475,6 +480,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     const result = await productivityReviewService(db).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
+      // Shrink the snooze below the 8-10h-old cancelled seeds so this test
+      // exercises the creation cap's cancelled-exclusion in isolation.
+      thresholds: { resolvedSnoozeMs: 60 * 60 * 1000 },
     });
 
     expect(result.created).toBe(1);
@@ -691,6 +699,167 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.snoozed).toBe(1);
     expect(result.created).toBe(0);
     expect(reviews).toHaveLength(1);
+  });
+
+  async function seedTerminalReview(
+    seeded: Awaited<ReturnType<typeof seedAssignedIssue>>,
+    opts: { status: "done" | "cancelled"; createdAt: Date; updatedAt: Date },
+  ) {
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      title: "Prior productivity review",
+      status: opts.status,
+      priority: "high",
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      parentId: seeded.issueId,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: opts.createdAt,
+      updatedAt: opts.updatedAt,
+    });
+  }
+
+  it("suppresses re-creation for a full 24h after the prior review closes as done", async () => {
+    // Regression for the OWN-139 -> OWN-146 double fire: the prior review was
+    // created 24h0m11s before the tick (escaping the created_at creation cap by
+    // 11 seconds) and closed 23h47m before the tick. The default resolved-review
+    // snooze must cover the whole first 24h after close.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await seedTerminalReview(seeded, {
+      status: "done",
+      createdAt: new Date(now.getTime() - (24 * 60 * 60 * 1000 + 11_000)),
+      updatedAt: new Date(now.getTime() - (23 * 60 * 60 * 1000 + 47 * 60 * 1000)),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.snoozed).toBe(1);
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+  });
+
+  it("suppresses re-creation for a full 24h after the prior review is cancelled", async () => {
+    // Regression for the OWN-144 -> OWN-145 double fire: the prior review was
+    // cancelled 6h0m6s before the tick, just past the old 6h snooze, and
+    // cancelled reviews never count toward the creation cap, so a duplicate
+    // fired on the first eligible tick. Cancellation must suppress for 24h too.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await seedTerminalReview(seeded, {
+      status: "cancelled",
+      createdAt: new Date(now.getTime() - (19 * 60 * 60 * 1000 + 28 * 60 * 1000)),
+      updatedAt: new Date(now.getTime() - (6 * 60 * 60 * 1000 + 6_000)),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.snoozed).toBe(1);
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+  });
+
+  it("keeps suppressing near the far edge of the 24h window after a cancellation", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await seedTerminalReview(seeded, {
+      status: "cancelled",
+      createdAt: new Date(now.getTime() - (23 * 60 * 60 * 1000 + 30 * 60 * 1000)),
+      updatedAt: new Date(now.getTime() - 23 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.snoozed).toBe(1);
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+  });
+
+  it("creates a new review once the prior close is older than 24h", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await seedTerminalReview(seeded, {
+      status: "done",
+      createdAt: new Date(now.getTime() - 26 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 25 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.snoozed).toBe(0);
+    expect(result.created).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(2);
+  });
+
+  it("honors a per-call resolvedSnoozeMs override below the 24h default", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    // Created outside the 24h creation cap so only the snooze override decides.
+    await seedTerminalReview(seeded, {
+      status: "done",
+      createdAt: new Date(now.getTime() - 25 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { resolvedSnoozeMs: 60 * 60 * 1000 },
+    });
+
+    expect(result.snoozed).toBe(0);
+    expect(result.created).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(2);
   });
 
   it("reports and logs soft-stop holds for open no-comment reviews", async () => {

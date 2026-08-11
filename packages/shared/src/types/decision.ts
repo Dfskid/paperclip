@@ -2,6 +2,84 @@ import type { IssueStatus } from "../constants.js";
 
 export type DecisionEffectStaleness = "strict" | "lenient";
 export type DecisionOptionStyle = "default" | "primary" | "destructive";
+export type DecisionAuthorityClass = "design_approval" | "execution_authority";
+export type DecisionCapability = "implementation" | "money" | "publish" | "deploy" | "delivery" | "merge";
+export type DecisionExternalGate =
+  | "github_actor"
+  | "codeowners_review"
+  | "branch_protection"
+  | "required_checks"
+  | "exact_head"
+  | "merge_gate";
+
+export interface DecisionAuthorityGrantV1 {
+  schemaVersion: 1;
+  authorityClass: DecisionAuthorityClass;
+  issuer: {
+    userId: string;
+    source: { kind: "issue" | "decision"; id: string };
+    issuedAt: string;
+  };
+  actor: { kind: "agent" | "user"; id: string };
+  targetIssueIds: string[];
+  capabilities: DecisionCapability[];
+  expiresAt: string;
+  requiredExternalGates: DecisionExternalGate[];
+}
+
+export interface DecisionTechnicalEvidenceV1 {
+  schemaVersion: 1;
+  provider: "github";
+  repository: {
+    id: string;
+    owner: string;
+    name: string;
+  };
+  pullRequest: {
+    number: number;
+    baseSha: string;
+    headSha: string;
+    mergeCommitSha: string | null;
+    mergedAt: string | null;
+  };
+  fingerprints: {
+    environment: string;
+    configuration: string;
+    branchRules: string;
+  };
+  observedAt: string;
+  expiresAt: string;
+  requiredChecks: Array<{
+    runId: string;
+    name: string;
+    appId: number | null;
+    conclusion: "success" | "failure" | "cancelled" | "timed_out" | "skipped" | "neutral" | "action_required";
+    commitSha: string;
+  }>;
+  reviews: Array<{
+    id: string;
+    actor: string;
+    state: "approved" | "changes_requested" | "commented" | "dismissed";
+    commitSha: string;
+    submittedAt: string;
+  }>;
+}
+
+export interface ExternalEnforcementEvidenceV1 {
+  schemaVersion: 1;
+  provider: "github";
+  repositoryId: string;
+  pullRequestNumber: number;
+  actor: string;
+  headSha: string;
+  evaluatedAt: string;
+  allowed: boolean;
+  gates: Array<{
+    type: DecisionExternalGate;
+    status: "passed" | "failed";
+    evidenceIds: string[];
+  }>;
+}
 
 export interface DecisionInput {
   id: string;
@@ -67,6 +145,21 @@ export type DecisionEffect =
   | CancelIssueTreeDecisionEffect
   | ResolveBlockerDecisionEffect;
 
+/** The minimum explicit authority needed by each mutating effect. */
+export function decisionEffectRequiredCapability(effect: DecisionEffect): DecisionCapability | null {
+  switch (effect.type) {
+    case "comment_on_issue":
+      return null;
+    case "create_issue":
+    case "assign_issue":
+      return "implementation";
+    case "update_issue_status":
+    case "cancel_issue_tree":
+    case "resolve_blocker":
+      return "delivery";
+  }
+}
+
 export function decisionEffectTargetIssueIds(effect: DecisionEffect): string[] {
   const ids = new Set([effect.targetIssueId]);
   if (effect.type === "create_issue") {
@@ -118,6 +211,7 @@ export interface AttentionArchiveManifestEntry {
   companyId: string;
   sourceKind: string;
   sourceId: string;
+  linkedIssueId: string;
   expectedVersion: number;
   activityAt: string;
   reason: string;

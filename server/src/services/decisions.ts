@@ -1,20 +1,39 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, asc, count, desc, eq, gt, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companyMemberships, decisionBundles, decisionEffectExecutions, decisionRetention, decisions, decisionTargetIssues, heartbeatRuns, issueRelations, issues } from "@paperclipai/db";
-import { ATTENTION_SOURCE_KINDS, decisionEffectTargetIssueIds } from "@paperclipai/shared";
-import type { AttentionArchiveManifestEntry, DecisionEffect, DecisionInput, DecisionOption, DecisionStatsCounts, DecisionStatsResponse } from "@paperclipai/shared";
+import { ATTENTION_SOURCE_KINDS, decisionEffectTargetIssueIds, decisionSpecSchema } from "@paperclipai/shared";
+import type {
+  AttentionArchiveManifestEntry,
+  DecisionAuthorityGrantV1,
+  DecisionEffect,
+  DecisionInput,
+  DecisionOption,
+  DecisionStatsCounts,
+  DecisionStatsResponse,
+  DecisionTechnicalEvidenceV1,
+  ExternalEnforcementEvidenceV1,
+} from "@paperclipai/shared";
 import { conflict, forbidden, notFound, tooManyRequests, unprocessable } from "../errors.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { signDecisionSpec, verifyDecisionSpec } from "./decision-signing.js";
 import { issueService } from "./issues.js";
 import { decisionRetentionService, hashAttentionArchiveManifest } from "./decision-retention.js";
+import {
+  revalidateDecisionEvidence,
+  type DecisionEvidenceCapture,
+  type DecisionEvidenceLoader,
+} from "./decision-evidence.js";
 
 type Snapshot = { status: string; assigneeAgentId: string | null; assigneeUserId: string | null; updatedAt: string;
   descendantCount?: number; descendantIds?: string[]; childCount?: number; attentionArchive?: unknown };
 type Wake = (input: { companyId: string; agentId: string; issueId: string; decisionId: string; outcome: "decided" | "expired" | "cancelled" }) => Promise<unknown>;
-export type DecisionServiceOptions = { wakeOriginAgent: Wake };
+export type DecisionServiceOptions = {
+  wakeOriginAgent: Wake;
+  loadDecisionEvidence?: DecisionEvidenceLoader;
+  captureDecisionEvidence?: DecisionEvidenceCapture;
+};
 const DAY = 86_400_000;
 
 function targetIds(options: DecisionOption[]) {
@@ -42,14 +61,64 @@ function sameIds(left: readonly string[], right: readonly string[]) {
   return rightIds.size === right.length && left.every((id) => rightIds.has(id));
 }
 
+function isSubset<T>(child: readonly T[], parent: readonly T[]) {
+  const parentValues = new Set(parent);
+  return child.every((value) => parentValues.has(value));
+}
+
 function sameInputValues(left: Record<string, string>, right: Record<string, string>) {
   const leftKeys = Object.keys(left);
   const rightKeys = Object.keys(right);
   return leftKeys.length === rightKeys.length && leftKeys.every((key) => left[key] === right[key]);
 }
 
-function spec(decision: { id: string; options: DecisionOption[]; targetSnapshots: Record<string, Snapshot> }) {
-  return { decisionId: decision.id, options: decision.options, targetSnapshots: decision.targetSnapshots };
+function spec(decision: {
+  id: string;
+  authority: DecisionAuthorityGrantV1 | null;
+  technicalEvidence: DecisionTechnicalEvidenceV1 | null;
+  externalEnforcement: ExternalEnforcementEvidenceV1 | null;
+  options: DecisionOption[];
+  inputs: DecisionInput[] | null;
+  targetSnapshots: Record<string, Snapshot>;
+}) {
+  return {
+    decisionId: decision.id,
+    authority: decision.authority,
+    technicalEvidence: decision.technicalEvidence,
+    externalEnforcement: decision.externalEnforcement,
+    options: decision.options,
+    inputs: decision.inputs,
+    targetSnapshots: decision.targetSnapshots,
+  };
+}
+
+function storedSpec(decision: typeof decisions.$inferSelect) {
+  return spec({
+    id: decision.id,
+    authority: decision.authority,
+    technicalEvidence: decision.technicalEvidence,
+    externalEnforcement: decision.externalEnforcement,
+    options: decision.options,
+    inputs: decision.inputs,
+    targetSnapshots: decision.targetSnapshots as Record<string, Snapshot>,
+  });
+}
+
+// Rows created before decision-governance evidence was introduced were signed
+// over this exact smaller shape. They remain verifiable, but deliberately
+// read-only: cancellation is the migration path to a newly proposed grant.
+function legacyStoredSpec(decision: typeof decisions.$inferSelect) {
+  return {
+    decisionId: decision.id,
+    options: decision.options,
+    targetSnapshots: decision.targetSnapshots,
+  };
+}
+
+function verifyStoredSpec(decision: typeof decisions.$inferSelect) {
+  return decision.authority === null
+    ? verifyDecisionSpec(legacyStoredSpec(decision), decision.signedSpec)
+    : verifyDecisionSpec(storedSpec(decision), decision.signedSpec);
 }
 
 function resource(issue: typeof issues.$inferSelect) {
@@ -70,6 +139,12 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+const CREATE_REQUEST_FINGERPRINT_KEY = "decisionCreateRequestFingerprint";
+
+function createRequestFingerprint(value: unknown) {
+  return `sha256:${createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
+}
+
 function parseAttentionArchiveManifest(
   companyId: string,
   targetSnapshots: Record<string, Snapshot>,
@@ -86,6 +161,8 @@ function parseAttentionArchiveManifest(
       || !ATTENTION_SOURCE_KINDS.includes(candidate.sourceKind as (typeof ATTENTION_SOURCE_KINDS)[number])
       || typeof candidate.sourceId !== "string"
       || !candidate.sourceId
+      || typeof candidate.linkedIssueId !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(candidate.linkedIssueId)
       || !Number.isInteger(candidate.expectedVersion)
       || Number(candidate.expectedVersion) < 1
       || typeof candidate.activityAt !== "string"
@@ -97,8 +174,9 @@ function parseAttentionArchiveManifest(
     seen.add(expectedKey);
     entries.push({
       companyId,
-      sourceKind: candidate.sourceKind,
-      sourceId: candidate.sourceId,
+        sourceKind: candidate.sourceKind,
+        sourceId: candidate.sourceId,
+        linkedIssueId: candidate.linkedIssueId,
       expectedVersion: Number(candidate.expectedVersion),
       activityAt: candidate.activityAt,
       reason: candidate.reason,
@@ -114,11 +192,34 @@ function boardCanActDirectly(actor: AuthorizationActor, companyId: string) {
     actor.memberships?.some((membership) => membership.companyId === companyId && membership.status === "active") === true;
 }
 
+function actorOwnsIssuerIdentity(actor: AuthorizationActor, issuerUserId: string) {
+  if (actor.type !== "board") return false;
+  if (actor.source === "local_implicit") {
+    return issuerUserId === (actor.userId ?? "local-implicit-board");
+  }
+  return actor.userId === issuerUserId;
+}
+
+function runtimeAuthorityDenial(
+  authority: DecisionAuthorityGrantV1,
+  decision: Pick<typeof decisions.$inferSelect, "originAgentId">,
+  decidedByUserId: string,
+  now = Date.now(),
+) {
+  if (authority.issuer.userId !== decidedByUserId) return "issuer_mismatch";
+  if (authority.actor.kind !== "agent" || authority.actor.id !== decision.originAgentId) return "actor_mismatch";
+  if (Date.parse(authority.expiresAt) <= now) return "authority_expired";
+  return null;
+}
+
 export function decisionService(db: Db, options: DecisionServiceOptions) {
   const authz = authorizationService(db);
   let targetSweepCursor: string | null = null;
   type CreateInput = { companyId: string; actor: AuthorizationActor; agentId: string; runId: string; bundleId?: string | null;
     ruleKey?: string | null; title: string; body: string; options: DecisionOption[]; inputs?: DecisionInput[] | null; expiresAt?: Date | null;
+    authority?: DecisionAuthorityGrantV1;
+    technicalEvidence?: DecisionTechnicalEvidenceV1 | null;
+    externalEnforcement?: ExternalEnforcementEvidenceV1 | null;
     idempotencyKey?: string | null; continuationPolicy?: "none" | "wake_origin_agent"; metadata?: Record<string, unknown> };
   type CreateInputWithSnapshots = CreateInput & { additionalTargetSnapshots?: Record<string, Snapshot> };
 
@@ -186,11 +287,205 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
   }
 
   async function createInStore(input: CreateInputWithSnapshots, dbOrTx: Db) {
+    if (input.actor.type !== "agent"
+      || input.actor.agentId !== input.agentId
+      || input.actor.runId !== input.runId
+      || input.actor.companyId !== input.companyId) {
+      throw forbidden("Decision provenance must match the authenticated origin agent run");
+    }
     if (input.idempotencyKey) {
       const lockKey = `decision-create:${input.companyId}:${input.idempotencyKey}`;
       await dbOrTx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
     }
     const provenance = await origin(input.companyId, input.agentId, input.runId);
+    const expiresAt = input.expiresAt ?? new Date(Date.now() + 7 * DAY);
+    if (expiresAt.getTime() <= Date.now() || expiresAt.getTime() > Date.now() + 30 * DAY) throw unprocessable("expiresAt must be within 30 days");
+    const isArchiveProposal = input.metadata?.kind === "attention_archive_proposal";
+    const archiveManifest = isArchiveProposal
+      ? parseAttentionArchiveManifest(input.companyId, input.additionalTargetSnapshots ?? {})
+      : null;
+    if (isArchiveProposal && !archiveManifest) {
+      throw unprocessable("Attention archive proposals require an exact signed manifest");
+    }
+    const inferredIssuerUserId = provenance.run.responsibleUserId ?? null;
+    const originTimestamp = provenance.run.startedAt ?? provenance.run.createdAt;
+    const archiveTargetIssueIds = archiveManifest
+      ? [...new Set(archiveManifest.map((entry) => entry.linkedIssueId))].sort()
+      : [];
+    if (isArchiveProposal) {
+      // The signed retention manifest names its bounded delivery targets even
+      // though the archive action is not an ordinary issue effect. Resolve the
+      // targets now so a missing, cross-company, or invisible UUID cannot be
+      // certified as execution authority.
+      await snapshots(input.companyId, archiveTargetIssueIds, input.actor, new Map(), new Set(), dbOrTx);
+    }
+    if (!inferredIssuerUserId || input.actor.onBehalfOfUserId !== inferredIssuerUserId) {
+      throw forbidden("Decision authority issuer must match the authenticated origin-run responsible user");
+    }
+    if (input.authority && (
+      input.authority.issuer.userId !== inferredIssuerUserId
+      || input.authority.actor.kind !== "agent"
+      || input.authority.actor.id !== input.agentId
+    )) {
+      throw forbidden("Decision authority issuer and actor must match authenticated origin provenance");
+    }
+    const authority = input.authority
+      ? {
+        ...input.authority,
+        // Paperclip, not the proposing client, binds issuance to the trusted run
+        // event. This is deterministic for idempotent retries.
+        issuer: { ...input.authority.issuer, issuedAt: originTimestamp.toISOString() },
+      }
+      : (isArchiveProposal && inferredIssuerUserId
+      ? {
+        schemaVersion: 1 as const,
+        authorityClass: "execution_authority" as const,
+        issuer: {
+          userId: inferredIssuerUserId,
+          source: { kind: "issue" as const, id: provenance.issueId },
+          issuedAt: originTimestamp.toISOString(),
+        },
+        actor: { kind: "agent" as const, id: input.agentId },
+        targetIssueIds: archiveTargetIssueIds,
+        capabilities: ["delivery" as const],
+        expiresAt: new Date(originTimestamp.getTime() + 30 * DAY).toISOString(),
+        requiredExternalGates: [],
+      }
+      : null);
+    if (!authority) throw unprocessable("Decision authority is required");
+    if (isArchiveProposal && (
+      authority.authorityClass !== "execution_authority"
+      || !authority.capabilities.includes("delivery")
+      || !sameIds(authority.targetIssueIds, archiveTargetIssueIds)
+    )) {
+      throw unprocessable("Attention archive proposals require delivery authority over every linked issue target");
+    }
+    const parsedSpec = decisionSpecSchema.safeParse({
+      authority,
+      technicalEvidence: input.technicalEvidence ?? null,
+      externalEnforcement: input.externalEnforcement ?? null,
+      options: input.options,
+      inputs: input.inputs ?? null,
+    });
+    if (!parsedSpec.success) {
+      throw unprocessable("Decision authority, effects, or evidence are incompatible", {
+        code: "invalid_decision_governance",
+        issues: parsedSpec.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),
+      });
+    }
+    let storedTechnicalEvidence = parsedSpec.data.technicalEvidence ?? null;
+    let storedExternalEnforcement = parsedSpec.data.externalEnforcement ?? null;
+    if (authority.actor.kind !== "agent" || authority.actor.id !== input.agentId) {
+      throw forbidden("Decision authority actor must match the authenticated origin agent");
+    }
+    if (authority.issuer.source.kind === "issue" && authority.issuer.source.id !== provenance.issueId) {
+      throw forbidden("Decision authority source must match the origin issue");
+    }
+    if (authority.issuer.source.kind === "decision") {
+      const parent = await dbOrTx.select().from(decisions).where(and(
+        eq(decisions.id, authority.issuer.source.id),
+        eq(decisions.companyId, input.companyId),
+      )).then((rows) => rows[0] ?? null);
+      const parentMetadata = parent?.metadata as Record<string, unknown> | undefined;
+      const parentGovernance = parent && verifyStoredSpec(parent)
+        ? decisionSpecSchema.safeParse({
+          authority: parent.authority,
+          technicalEvidence: parent.technicalEvidence,
+          externalEnforcement: parent.externalEnforcement,
+          options: parent.options,
+          inputs: parent.inputs,
+        })
+        : null;
+      const parentAuthority = parentGovernance?.success ? parentGovernance.data.authority : null;
+      const selected = parent?.options.find((option) => option.id === parent.chosenOptionId);
+      const constrained = parent
+        && parent.status === "decided"
+        && parent.executionStatus === "succeeded"
+        && parentMetadata?.dismissed !== true
+        && selected
+        && parentAuthority
+        && parentAuthority.issuer.userId === authority.issuer.userId
+        && parentAuthority.actor.kind === authority.actor.kind
+        && parentAuthority.actor.id === authority.actor.id
+        && (authority.authorityClass !== "execution_authority" || parentAuthority.authorityClass === "execution_authority")
+        && isSubset(authority.targetIssueIds, parentAuthority.targetIssueIds)
+        && isSubset(authority.capabilities, parentAuthority.capabilities)
+        // Required gates are constraints, not delegated powers. A child may
+        // narrow targets/capabilities and add safeguards, but it can never shed
+        // a gate that constrained the signed parent grant.
+        && isSubset(parentAuthority.requiredExternalGates, authority.requiredExternalGates)
+        && Date.parse(authority.expiresAt) <= Date.parse(parentAuthority.expiresAt);
+      if (!constrained) {
+        throw forbidden("Decision-sourced authority must be a valid subset of its signed, selected parent grant");
+      }
+    }
+    if (Date.parse(authority.issuer.issuedAt) > Date.now() + 5 * 60_000) {
+      throw unprocessable("Decision authority cannot be issued in the future");
+    }
+    if (Date.parse(authority.expiresAt) < expiresAt.getTime()) {
+      throw unprocessable("Decision cannot outlive its authority grant");
+    }
+    const requestFingerprint = createRequestFingerprint({
+      companyId: input.companyId,
+      agentId: input.agentId,
+      runId: input.runId,
+      bundleId: input.bundleId ?? null,
+      title: input.title,
+      body: input.body,
+      ruleKey: input.ruleKey ?? null,
+      authority,
+      technicalEvidence: input.technicalEvidence
+        ? { ...input.technicalEvidence, observedAt: null }
+        : null,
+      externalEnforcement: input.externalEnforcement
+        ? { ...input.externalEnforcement, evaluatedAt: null }
+        : null,
+      options: input.options,
+      inputs: input.inputs ?? null,
+      expiresAt: input.expiresAt?.toISOString() ?? null,
+      continuationPolicy: input.continuationPolicy ?? "none",
+      metadata: input.metadata ?? {},
+      additionalTargetSnapshots: input.additionalTargetSnapshots ?? null,
+    });
+    if (input.idempotencyKey) {
+      const existing = await dbOrTx.select().from(decisions).where(and(
+        eq(decisions.companyId, input.companyId),
+        eq(decisions.idempotencyKey, input.idempotencyKey),
+      )).then((rows) => rows[0] ?? null);
+      if (existing) {
+        const existingMetadata = existing.metadata as Record<string, unknown>;
+        const storedFingerprint = existingMetadata?.[CREATE_REQUEST_FINGERPRINT_KEY];
+        if (storedFingerprint === requestFingerprint) return existing;
+        if (typeof storedFingerprint === "string") {
+          throw conflict("Decision idempotency key already used with a different payload");
+        }
+        // Pre-fingerprint rows fall through to the provider-backed compatibility
+        // comparison below. New rows never recapture provider evidence on an
+        // exact semantic retry.
+      }
+    }
+    if (input.technicalEvidence && Date.parse(input.technicalEvidence.expiresAt) <= Date.now()) {
+      throw unprocessable("Decision technical evidence is already expired");
+    }
+    if (input.technicalEvidence && input.externalEnforcement) {
+      const validation = await revalidateDecisionEvidence({
+        companyId: input.companyId,
+        expectedTechnicalEvidence: input.technicalEvidence,
+        expectedExternalEnforcement: input.externalEnforcement,
+        load: options.loadDecisionEvidence,
+      });
+      if (!validation.ok) {
+        throw unprocessable("Decision evidence could not be verified against the provider", {
+          code: "decision_evidence_unverified",
+          reason: validation.reason,
+        });
+      }
+      // Only provider-resolved bytes become the signed record. Caller-supplied
+      // timestamps and evidence identifiers are locators for validation, never
+      // authenticated facts merely because Paperclip received them.
+      storedTechnicalEvidence = validation.technicalEvidence;
+      storedExternalEnforcement = validation.externalEnforcement;
+    }
     if (input.idempotencyKey) {
       const existing = await dbOrTx.select().from(decisions).where(and(eq(decisions.companyId, input.companyId), eq(decisions.idempotencyKey, input.idempotencyKey)))
         .then((rows) => rows[0] ?? null);
@@ -202,6 +497,9 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         );
         const equivalent = existing.title === input.title && existing.body === input.body &&
           canonicalJson(existing.options) === canonicalJson(input.options) && canonicalJson(existing.inputs ?? null) === canonicalJson(input.inputs ?? null) &&
+          canonicalJson(existing.authority) === canonicalJson(authority) &&
+          canonicalJson(existing.technicalEvidence) === canonicalJson(storedTechnicalEvidence) &&
+          canonicalJson(existing.externalEnforcement) === canonicalJson(storedExternalEnforcement) &&
           archiveEquivalent;
         if (!equivalent) throw conflict("Decision idempotency key already used with a different payload");
         return existing;
@@ -210,8 +508,6 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     const open = await dbOrTx.select({ value: count() }).from(decisions).where(and(eq(decisions.companyId, input.companyId), eq(decisions.originAgentId, input.agentId), eq(decisions.status, "open")));
     const cap = Number(process.env.PAPERCLIP_DECISIONS_OPEN_CAP ?? 50);
     if (Number(open[0]?.value ?? 0) >= cap) throw tooManyRequests("Open decision cap reached");
-    const expiresAt = input.expiresAt ?? new Date(Date.now() + 7 * DAY);
-    if (expiresAt.getTime() <= Date.now() || expiresAt.getTime() > Date.now() + 30 * DAY) throw unprocessable("expiresAt must be within 30 days");
     const ids = targetIds(input.options);
     const cancellationTargetIds = new Set(input.options.flatMap((option) => option.effects
       .filter((effect) => effect.type === "cancel_issue_tree").map((effect) => effect.targetIssueId)));
@@ -222,13 +518,24 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     const id = randomUUID();
     const [created] = await dbOrTx.insert(decisions).values({ id, companyId: input.companyId, bundleId: input.bundleId ?? null,
       originAgentId: input.agentId, originIssueId: provenance.issueId, originRunId: input.runId, ruleKey: input.ruleKey ?? null,
-      title: input.title, body: input.body, options: input.options, inputs: input.inputs ?? null, expiresAt,
-      idempotencyKey: input.idempotencyKey ?? null, signedSpec: signDecisionSpec(spec({ id, options: input.options, targetSnapshots })),
-      targetSnapshots, continuationPolicy: input.continuationPolicy ?? "none", metadata: input.metadata ?? {} }).onConflictDoNothing().returning();
+      title: input.title, body: input.body, authority, technicalEvidence: storedTechnicalEvidence,
+      externalEnforcement: storedExternalEnforcement, options: input.options, inputs: input.inputs ?? null, expiresAt,
+      idempotencyKey: input.idempotencyKey ?? null, signedSpec: signDecisionSpec(spec({ id, authority,
+        technicalEvidence: storedTechnicalEvidence, externalEnforcement: storedExternalEnforcement,
+        options: input.options, inputs: input.inputs ?? null, targetSnapshots })),
+      targetSnapshots, continuationPolicy: input.continuationPolicy ?? "none", metadata: {
+        ...(input.metadata ?? {}),
+        [CREATE_REQUEST_FINGERPRINT_KEY]: requestFingerprint,
+      } }).onConflictDoNothing().returning();
     if (!created) {
       const existing = input.idempotencyKey
         ? await dbOrTx.select().from(decisions).where(and(eq(decisions.companyId, input.companyId), eq(decisions.idempotencyKey, input.idempotencyKey))).then((rows) => rows[0] ?? null)
         : null;
+      const storedFingerprint = (existing?.metadata as Record<string, unknown> | undefined)?.[CREATE_REQUEST_FINGERPRINT_KEY];
+      if (storedFingerprint === requestFingerprint) return existing!;
+      if (typeof storedFingerprint === "string") {
+        throw conflict("Decision idempotency key already used with a different payload");
+      }
       const archiveEquivalent = !existing || input.additionalTargetSnapshots === undefined || (
         canonicalJson(existing.metadata ?? {}) === canonicalJson(input.metadata ?? {}) &&
         canonicalJson(Object.fromEntries(Object.entries(existing.targetSnapshots as Record<string, Snapshot>)
@@ -236,6 +543,9 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       );
       const equivalent = existing && existing.title === input.title && existing.body === input.body &&
         canonicalJson(existing.options) === canonicalJson(input.options) && canonicalJson(existing.inputs ?? null) === canonicalJson(input.inputs ?? null) &&
+        canonicalJson(existing.authority) === canonicalJson(authority) &&
+        canonicalJson(existing.technicalEvidence) === canonicalJson(storedTechnicalEvidence) &&
+        canonicalJson(existing.externalEnforcement) === canonicalJson(storedExternalEnforcement) &&
         archiveEquivalent;
       if (equivalent) return existing;
       throw conflict("Decision idempotency key already used with a different payload");
@@ -421,6 +731,53 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
           const [row] = await tx.update(decisionEffectExecutions).set({ status, error: reason, result: details, activityLogId: activity?.id ?? null, executedAt: new Date() }).where(eq(decisionEffectExecutions.id, execution!.id)).returning();
           return row;
         };
+        const governance = decisionSpecSchema.safeParse({
+          authority: decision.authority,
+          technicalEvidence: decision.technicalEvidence,
+          externalEnforcement: decision.externalEnforcement,
+          options: decision.options,
+          inputs: decision.inputs,
+        });
+        if (!governance.success) {
+          return finish("failed", "deny_decision_authority", {
+            reason: "deny_decision_authority",
+            authorityReason: "invalid_or_legacy_authority",
+          });
+        }
+        const authority = governance.data.authority;
+        const authorityReason = runtimeAuthorityDenial(authority, decision, decidedByUserId);
+        if (authorityReason) {
+          return finish("failed", "deny_decision_authority", {
+            reason: "deny_decision_authority",
+            authorityReason,
+          });
+        }
+        if (governance.data.technicalEvidence && governance.data.externalEnforcement) {
+          const validation = await revalidateDecisionEvidence({
+            companyId: decision.companyId,
+            expectedTechnicalEvidence: governance.data.technicalEvidence,
+            expectedExternalEnforcement: governance.data.externalEnforcement,
+            load: options.loadDecisionEvidence,
+          });
+          await tx.update(decisions).set({
+            latestEnforcementResult: validation.externalEnforcement,
+            updatedAt: new Date(),
+            ...(!validation.ok ? {
+              executionStatus: "blocked",
+              metadata: {
+                ...decision.metadata,
+                governanceBlockedReason: validation.reason,
+                governanceBlockedAt: new Date().toISOString(),
+              },
+            } : {}),
+          }).where(eq(decisions.id, decision.id));
+          if (!validation.ok) {
+            return finish("failed", validation.reason ?? "external_enforcement_denied", {
+              reason: validation.reason ?? "external_enforcement_denied",
+              externalEnforcement: validation.externalEnforcement,
+            });
+          }
+        }
         const directReferencedIds = new Set(decisionEffectTargetIssueIds(effect));
         const snapshots = decision.targetSnapshots as Record<string, Snapshot>;
         const cancellationDescendantIds = effect.type === "cancel_issue_tree"
@@ -533,26 +890,118 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
   }
 
   async function runEffects(decision: typeof decisions.$inferSelect, userActor: AuthorizationActor) {
+    const signatureValid = verifyStoredSpec(decision);
+    const governanceEntryReason = !signatureValid
+      ? "deny_decision_signature"
+      : decision.authority === null
+      ? "deny_legacy_authority"
+      : null;
+    if (governanceEntryReason) {
+      const blockedAt = new Date();
+      await db.update(decisionEffectExecutions).set({
+        status: "failed",
+        error: governanceEntryReason,
+        result: { reason: governanceEntryReason },
+        executedAt: blockedAt,
+      }).where(and(
+        eq(decisionEffectExecutions.decisionId, decision.id),
+        eq(decisionEffectExecutions.status, "claimed"),
+      ));
+      await db.update(decisions).set({
+        executionStatus: "blocked",
+        updatedAt: blockedAt,
+        metadata: decision.continuationPolicy === "wake_origin_agent"
+          ? sql`coalesce(${decisions.metadata}, '{}'::jsonb) || jsonb_build_object(
+              'governanceBlockedReason', ${governanceEntryReason}::text,
+              'governanceBlockedAt', ${blockedAt.toISOString()}::text,
+              'continuationPending', true
+            )`
+          : sql`coalesce(${decisions.metadata}, '{}'::jsonb) || jsonb_build_object(
+              'governanceBlockedReason', ${governanceEntryReason}::text,
+              'governanceBlockedAt', ${blockedAt.toISOString()}::text
+            )`,
+      }).where(eq(decisions.id, decision.id));
+      await logActivity(db, {
+        companyId: decision.companyId,
+        actorType: "system",
+        actorId: "decision-executor",
+        agentId: decision.originAgentId,
+        runId: decision.originRunId,
+        responsibleUserIdOverride: decision.decidedByUserId,
+        action: "decision.execution_blocked",
+        entityType: "decision",
+        entityId: decision.id,
+        details: { reason: governanceEntryReason },
+      });
+      return outcome(decision.id);
+    }
     const option = decision.options.find((item) => item.id === decision.chosenOptionId);
     if (!option || !decision.decidedByUserId) throw unprocessable("Stored decision outcome is invalid");
     const run = await db.select({ responsibleUserId: heartbeatRuns.responsibleUserId }).from(heartbeatRuns).where(eq(heartbeatRuns.id, decision.originRunId)).then((rows) => rows[0] ?? null);
     const metadata = decision.metadata as Record<string, unknown>;
     if (metadata.kind === "attention_archive_proposal") {
-      if (!verifyDecisionSpec(spec({
-        id: decision.id,
+      const manifest = parseAttentionArchiveManifest(
+        decision.companyId,
+        decision.targetSnapshots as Record<string, Snapshot>,
+      );
+      const manifestHash = manifest ? hashAttentionArchiveManifest(manifest) : null;
+      const archiveTargetIssueIds = manifest
+        ? [...new Set(manifest.map((entry) => entry.linkedIssueId))].sort()
+        : [];
+      const archiveGovernance = decisionSpecSchema.safeParse({
+        authority: decision.authority,
+        technicalEvidence: decision.technicalEvidence,
+        externalEnforcement: decision.externalEnforcement,
         options: decision.options,
-        targetSnapshots: decision.targetSnapshots as Record<string, Snapshot>,
-      }), decision.signedSpec)) {
-        await db.update(decisions).set({ executionStatus: "failed", updatedAt: new Date(), metadata: { ...metadata, archiveProposalError: "invalid_signature" } })
+        inputs: decision.inputs,
+      });
+      const archiveAuthority = archiveGovernance.success ? archiveGovernance.data.authority : null;
+      if (!archiveAuthority
+        || archiveAuthority.authorityClass !== "execution_authority"
+        || !archiveAuthority.capabilities.includes("delivery")
+        || !sameIds(archiveAuthority.targetIssueIds, archiveTargetIssueIds)) {
+        await db.update(decisions).set({ executionStatus: "blocked", updatedAt: new Date(), metadata: {
+          ...metadata,
+          archiveProposalError: "deny_attention_archive_authority",
+          governanceBlockedReason: "deny_attention_archive_authority",
+        } })
           .where(eq(decisions.id, decision.id));
         return outcome(decision.id);
       }
+      const archiveAuthorityReason = runtimeAuthorityDenial(
+        archiveAuthority,
+        decision,
+        decision.decidedByUserId,
+      );
+      if (archiveAuthorityReason) {
+        const blockedAt = new Date();
+        await db.update(decisions).set({
+          executionStatus: "blocked",
+          updatedAt: blockedAt,
+          metadata: {
+            ...metadata,
+            archiveProposalError: "deny_decision_authority",
+            governanceBlockedReason: "deny_decision_authority",
+            governanceBlockedAt: blockedAt.toISOString(),
+            authorityReason: archiveAuthorityReason,
+            ...(decision.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}),
+          },
+        }).where(eq(decisions.id, decision.id));
+        await logActivity(db, {
+          companyId: decision.companyId,
+          actorType: "system",
+          actorId: "decision-executor",
+          agentId: decision.originAgentId,
+          runId: decision.originRunId,
+          responsibleUserIdOverride: decision.decidedByUserId,
+          action: "decision.execution_blocked",
+          entityType: "decision",
+          entityId: decision.id,
+          details: { reason: "deny_decision_authority", authorityReason: archiveAuthorityReason },
+        });
+        return outcome(decision.id);
+      }
       if (option.id === "archive") {
-        const manifest = parseAttentionArchiveManifest(
-          decision.companyId,
-          decision.targetSnapshots as Record<string, Snapshot>,
-        );
-        const manifestHash = manifest ? hashAttentionArchiveManifest(manifest) : null;
         if (!manifest || manifestHash !== metadata.manifestHash) {
           await db.update(decisions).set({ executionStatus: "failed", updatedAt: new Date(), metadata: { ...metadata, archiveProposalError: "manifest_mismatch" } })
             .where(eq(decisions.id, decision.id));
@@ -627,7 +1076,26 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     userActor: AuthorizationActor; dismissed?: boolean; dismissReason?: string | null }) {
     const current = await get(input.id); if (!current) throw notFound("Decision not found");
     const metadata = current.metadata as Record<string, unknown>;
-    if (!verifyDecisionSpec(spec({ id: current.id, options: current.options, targetSnapshots: current.targetSnapshots as Record<string, Snapshot> }), current.signedSpec)) throw forbidden("Decision signature verification failed");
+    if (!verifyStoredSpec(current)) throw forbidden("Decision signature verification failed");
+    if (current.authority === null) throw forbidden("Decision has invalid or legacy read-only authority");
+    const governance = decisionSpecSchema.safeParse({
+      authority: current.authority,
+      technicalEvidence: current.technicalEvidence,
+      externalEnforcement: current.externalEnforcement,
+      options: current.options,
+      inputs: current.inputs,
+    });
+    if (!governance.success) throw forbidden("Decision has invalid or legacy read-only authority");
+    if (!actorOwnsIssuerIdentity(input.userActor, input.decidedByUserId)) {
+      throw forbidden("The authenticated board session does not own the authority issuer identity");
+    }
+    if (governance.data.authority.issuer.userId !== input.decidedByUserId) {
+      throw forbidden("Only the authenticated authority issuer may decide this action");
+    }
+    if (governance.data.authority.actor.kind !== "agent"
+      || governance.data.authority.actor.id !== current.originAgentId) {
+      throw forbidden("Decision authority actor no longer matches its origin");
+    }
     if (current.status === "decided" && input.idempotencyKey && metadata.decideIdempotencyKey === input.idempotencyKey) {
       if (current.decidedByUserId !== input.decidedByUserId) throw forbidden("Decision replay belongs to a different user");
       return resumeDecision(current, input.userActor);
@@ -638,6 +1106,36 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       return resumeDecision(current, input.userActor);
     }
     if (current.status !== "open") throw conflict("decision_already_resolved", { code: "decision_already_resolved" });
+    if (Date.parse(governance.data.authority.expiresAt) <= Date.now()) {
+      const deniedAt = new Date();
+      const [expired] = await db.update(decisions).set({
+        status: "expired",
+        updatedAt: deniedAt,
+        metadata: {
+          ...metadata,
+          expiredReason: "authority_expired",
+          authorityReason: "authority_expired",
+          governanceBlockedReason: "deny_decision_authority",
+          governanceBlockedAt: deniedAt.toISOString(),
+          ...(current.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}),
+        },
+      }).where(and(eq(decisions.id, current.id), eq(decisions.status, "open"))).returning();
+      if (expired) {
+        await logActivity(db, {
+          companyId: expired.companyId,
+          actorType: "system",
+          actorId: "decision-expiry-sweeper",
+          agentId: expired.originAgentId,
+          runId: expired.originRunId,
+          action: "decision.expired",
+          entityType: "decision",
+          entityId: expired.id,
+          details: { expiredReason: "authority_expired" },
+        });
+        await deliverContinuation(expired, "expired");
+      }
+      throw conflict("decision_authority_expired", { code: "decision_authority_expired" });
+    }
     if (current.expiresAt <= new Date()) {
       const [expired] = await db.update(decisions).set({ status: "expired", updatedAt: new Date(), metadata: { ...metadata, expiredReason: "ttl",
         ...(current.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } })
@@ -684,18 +1182,33 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
 
   async function dismiss(id: string, userId: string, userActor: AuthorizationActor, reason?: string | null) {
     const current = await get(id); if (!current) throw notFound("Decision not found");
-    if (!verifyDecisionSpec(spec({ id: current.id, options: current.options, targetSnapshots: current.targetSnapshots as Record<string, Snapshot> }), current.signedSpec)) throw forbidden("Decision signature verification failed");
+    if (!verifyStoredSpec(current)) throw forbidden("Decision signature verification failed");
+    const finishSafeDismissal = async () => {
+      const [updated] = await db.update(decisions).set({ status: "decided", executionStatus: "succeeded", chosenOptionId: "dismissed", decidedByUserId: userId,
+        decidedAt: new Date(), updatedAt: new Date(), metadata: { ...current.metadata, dismissed: true, dismissReason: reason ?? null,
+          ...(current.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } }).where(and(eq(decisions.id, id), eq(decisions.status, "open"))).returning();
+      if (!updated) throw conflict("decision_already_resolved", { code: "decision_already_resolved" });
+      await logActivity(db, { companyId: updated.companyId, actorType: "system", actorId: "decision-executor", agentId: updated.originAgentId,
+        runId: updated.originRunId, responsibleUserIdOverride: userId, action: "decision.dismissed", entityType: "decision", entityId: updated.id,
+        details: { chosenOptionId: "dismissed", decidedByUserId: userId, dismissed: true } });
+      await deliverContinuation(updated, "decided");
+      return outcome(id);
+    };
+    if (current.authority === null) {
+      if (!actorOwnsIssuerIdentity(userActor, userId) || !boardCanActDirectly(userActor, current.companyId)) {
+        throw forbidden("Only an authenticated board member may safely dismiss a legacy decision");
+      }
+      return finishSafeDismissal();
+    }
+    const governance = decisionSpecSchema.safeParse({ authority: current.authority,
+      technicalEvidence: current.technicalEvidence, externalEnforcement: current.externalEnforcement,
+      options: current.options, inputs: current.inputs });
+    if (!governance.success || governance.data.authority.issuer.userId !== userId || !actorOwnsIssuerIdentity(userActor, userId)) {
+      throw forbidden("Only the authenticated authority issuer may dismiss this decision");
+    }
     const empty = current.options.find((option) => option.effects.length === 0);
     if (empty) return decide({ id, optionId: empty.id, decidedByUserId: userId, userActor, dismissed: true, dismissReason: reason });
-    const [updated] = await db.update(decisions).set({ status: "decided", executionStatus: "succeeded", chosenOptionId: "dismissed", decidedByUserId: userId,
-      decidedAt: new Date(), updatedAt: new Date(), metadata: { ...current.metadata, dismissed: true, dismissReason: reason ?? null,
-        ...(current.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } }).where(and(eq(decisions.id, id), eq(decisions.status, "open"))).returning();
-    if (!updated) throw conflict("decision_already_resolved", { code: "decision_already_resolved" });
-    await logActivity(db, { companyId: updated.companyId, actorType: "system", actorId: "decision-executor", agentId: updated.originAgentId,
-      runId: updated.originRunId, responsibleUserIdOverride: userId, action: "decision.dismissed", entityType: "decision", entityId: updated.id,
-      details: { chosenOptionId: "dismissed", decidedByUserId: userId, dismissed: true } });
-    await deliverContinuation(updated, "decided");
-    return outcome(id);
+    return finishSafeDismissal();
   }
 
   async function createBundle(input: { companyId: string; actor: AuthorizationActor; agentId: string; runId: string; title: string; summary: string;

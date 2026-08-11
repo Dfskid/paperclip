@@ -13,18 +13,33 @@ export {
   decisionOptionSchema,
   decisionOptionsSchema,
   decisionInputsSchema,
+  decisionAuthorityClassSchema,
+  decisionCapabilitySchema,
+  decisionExternalGateSchema,
+  decisionAuthorityGrantSchema,
+  decisionTechnicalEvidenceSchema,
+  externalEnforcementEvidenceSchema,
   decisionSpecSchema,
   type DecisionEffectInput,
   type DecisionOptionInput,
   type DecisionInputInput,
+  type DecisionAuthorityGrantInput,
+  type DecisionTechnicalEvidenceInput,
+  type ExternalEnforcementEvidenceInput,
   type DecisionSpecInput,
 } from "./validators/decision.js";
 
-export { decisionEffectTargetIssueIds } from "./types/decision.js";
+export { decisionEffectRequiredCapability, decisionEffectTargetIssueIds } from "./types/decision.js";
 
 export type {
   DecisionEffectStaleness,
   DecisionOptionStyle,
+  DecisionAuthorityClass,
+  DecisionCapability,
+  DecisionExternalGate,
+  DecisionAuthorityGrantV1,
+  DecisionTechnicalEvidenceV1,
+  ExternalEnforcementEvidenceV1,
   DecisionInput,
   CommentOnIssueDecisionEffect,
   CreateIssueDecisionEffect,

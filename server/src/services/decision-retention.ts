@@ -55,6 +55,7 @@ function canonicalManifest(manifest: readonly AttentionArchiveManifestEntry[]) {
     companyId: entry.companyId,
     sourceKind: entry.sourceKind,
     sourceId: entry.sourceId,
+    linkedIssueId: entry.linkedIssueId,
     expectedVersion: entry.expectedVersion,
     activityAt: entry.activityAt,
     reason: entry.reason,

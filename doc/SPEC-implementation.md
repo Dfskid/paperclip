@@ -880,6 +880,18 @@ Ownership split:
 - **Core / Free:** permission key and scoped-grant enforcement; responsible-user resolution; default-open, disabled, and allowlist policy modes; archive/unarchive APIs; per-user archive persistence; resurfacing behavior; activity audit records; and stable denial codes.
 - **Paperclip EE / Enterprise:** centralized policy administration beyond the per-user controls, organization-wide presets, policy simulation, bulk inbox operations, advanced compliance reporting, and richer administrative audit UX. EE may extend policy management surfaces but must not weaken core company boundaries, user policy restrictions, scoped grants, or audit requirements.
 
+## 9.12 Decision Authority and External Enforcement
+
+Decision approval and permission to create an external effect are distinct contracts:
+
+- `design_approval` records approval of a proposal. It can authorize an audit comment or the creation of separate blocked/unassigned follow-up work, but it cannot authorize implementation, spending, publication, deployment, delivery, or merge effects.
+- `execution_authority` names its issuer, source, validity window, actor, target set, capabilities, and required gates. An effect is allowed only by the intersection of those constraints; omitted or mismatched authority defaults to deny.
+- The signed decision envelope includes immutable repository, pull-request, base/head/merge, environment, repository-configuration, branch-rule, check-run, and review evidence. Before an effect, Paperclip reloads the provider state and blocks on missing, unavailable, expired, unparsable, or drifted evidence.
+- GitHub enforcement remains separate evidence. Paperclip never substitutes for the authenticated GitHub actor, CODEOWNERS approval, branch protection, required checks, exact-head binding, or GitHub's merge gate. All required gates must independently pass at effect time.
+- Every revalidation stores its result independently from the signed technical evidence. A failed or unavailable external check is never converted into a synthetic pass.
+
+After a provider confirms a pull request as merged with a complete immutable merge envelope, the merged-delivery residue sweep may cancel only active issues that have explicit delivery-origin provenance and the same structured pull-request work product. It preserves comments, runs, and audit history, records one idempotent consolidation audit, and never infers residue from issue prose, titles, or local branch names.
+
 ## 10. API Contract (REST)
 
 All endpoints are under `/api` and return JSON.

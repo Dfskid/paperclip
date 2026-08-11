@@ -3,8 +3,11 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import {
   createDecisionArchiveProposalSchema,
+  decisionAuthorityGrantSchema,
   decisionInputsSchema,
   decisionOptionsSchema,
+  decisionTechnicalEvidenceSchema,
+  externalEnforcementEvidenceSchema,
   type AttentionArchiveManifestEntry,
   type AttentionArchiveTargetSnapshot,
   type AttentionItem,
@@ -23,6 +26,9 @@ const createSchema = z.object({
   title: z.string().trim().min(1).max(500),
   body: z.string().max(100_000),
   ruleKey: z.string().trim().max(240).nullable().optional(),
+  authority: decisionAuthorityGrantSchema,
+  technicalEvidence: decisionTechnicalEvidenceSchema.nullable().optional(),
+  externalEnforcement: externalEnforcementEvidenceSchema.nullable().optional(),
   options: decisionOptionsSchema,
   inputs: decisionInputsSchema.nullable().optional(),
   expiresAt: z.coerce.date().optional(),
@@ -95,10 +101,17 @@ export function decisionRoutes(db: Db, options: DecisionServiceOptions) {
         if (!(await canReadDecisionSource(db, req.actor, companyId, attentionItem.sourceKind, attentionItem.subject.id))) {
           throw unprocessable("Every archive proposal item must be on the current aging shelf");
         }
+        const linkedIssueId = attentionItem.subject.kind === "issue"
+          ? attentionItem.subject.id
+          : attentionItem.relatedIssue?.id ?? null;
+        if (!linkedIssueId) {
+          throw unprocessable("Every archive proposal item must be linked to an issue authority target");
+        }
         manifest.push({
           companyId,
           sourceKind: attentionItem.sourceKind,
           sourceId: attentionItem.subject.id,
+          linkedIssueId,
           expectedVersion: attentionItem.retentionVersion,
           activityAt: attentionItem.activityAt,
           reason: item.reason,

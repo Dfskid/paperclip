@@ -840,6 +840,12 @@ export type { InboxDismissal, InboxDismissalKind } from "./inbox-dismissal.js";
 export type {
   DecisionEffectStaleness,
   DecisionOptionStyle,
+  DecisionAuthorityClass,
+  DecisionCapability,
+  DecisionExternalGate,
+  DecisionAuthorityGrantV1,
+  DecisionTechnicalEvidenceV1,
+  ExternalEnforcementEvidenceV1,
   DecisionInput,
   CommentOnIssueDecisionEffect,
   CreateIssueDecisionEffect,

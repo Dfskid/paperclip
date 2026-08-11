@@ -24,7 +24,17 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { attentionService } from "../services/attention.js";
 import { decisionService } from "../services/decisions.js";
 import { hashAttentionArchiveManifest } from "../services/decision-retention.js";
-import type { AttentionArchiveManifestEntry, AttentionArchiveTargetSnapshot } from "@paperclipai/shared";
+import {
+  decisionEffectRequiredCapability,
+  decisionEffectTargetIssueIds,
+  type AttentionArchiveManifestEntry,
+  type AttentionArchiveTargetSnapshot,
+  type DecisionAuthorityGrantV1,
+  type DecisionOption,
+  type DecisionTechnicalEvidenceV1,
+  type ExternalEnforcementEvidenceV1,
+} from "@paperclipai/shared";
+import { signDecisionSpec } from "../services/decision-signing.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describePg = support.supported ? describe : describe.skip;
@@ -39,26 +49,30 @@ describePg("decisionService", () => {
   let runId: string;
   let originResponsibleUserId: string;
   let decidedByUserId: string;
+  let otherBoardUserId: string;
   let wakes: Array<Record<string, unknown>>;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-decisions-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   beforeEach(async () => {
     process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "0123456789abcdef0123456789abcdef";
     companyId = randomUUID(); agentId = randomUUID(); originIssueId = randomUUID(); targetIssueId = randomUUID(); runId = randomUUID();
-    originResponsibleUserId = `origin-${randomUUID()}`; decidedByUserId = `decider-${randomUUID()}`; wakes = [];
+    originResponsibleUserId = `origin-${randomUUID()}`;
+    decidedByUserId = originResponsibleUserId;
+    otherBoardUserId = `other-${randomUUID()}`;
+    wakes = [];
     const now = new Date();
     await db.insert(companies).values({ id: companyId, name: "Decisions", issuePrefix: `D${companyId.slice(0, 6)}`, requireBoardApprovalForNewAgents: false });
     await db.insert(authUsers).values([
       { id: originResponsibleUserId, name: "Origin", email: `${originResponsibleUserId}@example.test`, createdAt: now, updatedAt: now },
-      { id: decidedByUserId, name: "Decider", email: `${decidedByUserId}@example.test`, createdAt: now, updatedAt: now },
+      { id: otherBoardUserId, name: "Other", email: `${otherBoardUserId}@example.test`, createdAt: now, updatedAt: now },
     ]);
     await db.insert(companyMemberships).values([
       { companyId, principalType: "user", principalId: originResponsibleUserId, status: "active", membershipRole: "member" },
-      { companyId, principalType: "user", principalId: decidedByUserId, status: "active", membershipRole: "member" },
+      { companyId, principalType: "user", principalId: otherBoardUserId, status: "active", membershipRole: "member" },
     ]);
     await db.insert(agents).values({ id: agentId, companyId, name: "Proposer", role: "engineer", status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
     await db.insert(issues).values([
@@ -81,7 +95,47 @@ describePg("decisionService", () => {
     onBehalfOfUserId: originResponsibleUserId, onBehalfOfMemberships: [{ companyId, membershipRole: "member", status: "active" }] });
   const boardActor = () => ({ type: "board" as const, userId: decidedByUserId, companyIds: [companyId], source: "session" as const,
     memberships: [{ companyId, membershipRole: "member", status: "active" }] });
-  const service = () => decisionService(db, { wakeOriginAgent: async (input) => { wakes.push(input); } });
+  const authorityFor = (options: DecisionOption[]): DecisionAuthorityGrantV1 => {
+    const targetIssueIds = [...new Set(options.flatMap((option) => option.effects.flatMap(decisionEffectTargetIssueIds)))];
+    const capabilities = [...new Set(options.flatMap((option) => option.effects
+      .map(decisionEffectRequiredCapability)
+      .filter((capability): capability is NonNullable<typeof capability> => capability !== null)))];
+    return capabilities.length === 0
+      ? {
+        schemaVersion: 1,
+        authorityClass: "design_approval",
+        issuer: { userId: decidedByUserId, source: { kind: "issue", id: originIssueId }, issuedAt: new Date(Date.now() - 1_000).toISOString() },
+        actor: { kind: "agent", id: agentId },
+        targetIssueIds,
+        capabilities: [],
+        expiresAt: new Date(Date.now() + 14 * 86_400_000).toISOString(),
+        requiredExternalGates: [],
+      }
+      : {
+        schemaVersion: 1,
+        authorityClass: "execution_authority",
+        issuer: { userId: decidedByUserId, source: { kind: "issue", id: originIssueId }, issuedAt: new Date(Date.now() - 1_000).toISOString() },
+        actor: { kind: "agent", id: agentId },
+        targetIssueIds,
+        capabilities,
+        expiresAt: new Date(Date.now() + 14 * 86_400_000).toISOString(),
+        requiredExternalGates: [],
+      };
+  };
+  const service = () => {
+    const inner = decisionService(db, { wakeOriginAgent: async (input) => { wakes.push(input); } });
+    type CreateInput = Parameters<typeof inner.create>[0];
+    type CreateBundleInput = Parameters<typeof inner.createBundle>[0];
+    return {
+      ...inner,
+      create: (input: CreateInput, dbOrTx?: Parameters<typeof inner.create>[1]) =>
+        inner.create({ ...input, authority: input.authority ?? authorityFor(input.options) }, dbOrTx),
+      createBundle: (input: CreateBundleInput) => inner.createBundle({
+        ...input,
+        decisions: input.decisions.map((item) => ({ ...item, authority: item.authority ?? authorityFor(item.options) })),
+      }),
+    };
+  };
   const createCommentDecision = (staleness: "strict" | "lenient" = "lenient", extra: Record<string, unknown> = {}) => service().create({
     companyId, actor: agentActor(), agentId, runId, title: "Comment?", body: "Body", continuationPolicy: "wake_origin_agent",
     options: [{ id: "yes", label: "Yes", effects: [{ type: "comment_on_issue", targetIssueId, staleness, bodyMarkdown: "hello" }] }],
@@ -98,14 +152,157 @@ describePg("decisionService", () => {
   const expireDecisionNow = (id: string) =>
     db.update(decisions).set({ expiresAt: new Date(Date.now() - 1_000) }).where(eq(decisions.id, id));
 
+  const evidencePair = () => {
+    const headSha = "a".repeat(40);
+    const observedAt = new Date(Date.now() - 60_000).toISOString();
+    const evaluatedAt = new Date(Date.now() - 30_000).toISOString();
+    const technicalEvidence: DecisionTechnicalEvidenceV1 = {
+      schemaVersion: 1,
+      provider: "github",
+      repository: { id: "repository-1", owner: "paperclipai", name: "paperclip" },
+      pullRequest: { number: 321, baseSha: "b".repeat(40), headSha, mergeCommitSha: null, mergedAt: null },
+      fingerprints: {
+        environment: `sha256:${"1".repeat(64)}`,
+        configuration: `sha256:${"2".repeat(64)}`,
+        branchRules: `sha256:${"3".repeat(64)}`,
+      },
+      observedAt,
+      expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      requiredChecks: [{ runId: "check-1", name: "test", appId: 42, conclusion: "success", commitSha: headSha }],
+      reviews: [{ id: "review-1", actor: "maintainer", state: "approved", commitSha: headSha, submittedAt: observedAt }],
+    };
+    const gates: ExternalEnforcementEvidenceV1["gates"] = [
+      "github_actor",
+      "codeowners_review",
+      "branch_protection",
+      "required_checks",
+      "exact_head",
+      "merge_gate",
+    ].map((type) => ({
+      type: type as ExternalEnforcementEvidenceV1["gates"][number]["type"],
+      status: "passed" as const,
+      evidenceIds: [`github:${type}:proof`],
+    }));
+    const externalEnforcement: ExternalEnforcementEvidenceV1 = {
+      schemaVersion: 1,
+      provider: "github",
+      repositoryId: technicalEvidence.repository.id,
+      pullRequestNumber: technicalEvidence.pullRequest.number,
+      actor: "maintainer",
+      headSha,
+      evaluatedAt,
+      allowed: true,
+      gates,
+    };
+    return { technicalEvidence, externalEnforcement };
+  };
+
   it("returns the existing decision for concurrent idempotent creates", async () => {
+    const options: DecisionOption[] = [{ id: "yes", label: "Yes", effects: [{
+      type: "comment_on_issue", targetIssueId, staleness: "lenient", bodyMarkdown: "hello",
+    }] }];
     const input = {
       companyId, actor: agentActor(), agentId, runId, title: "Same?", body: "Body", idempotencyKey: "concurrent-create",
-      options: [{ id: "yes", label: "Yes", effects: [{ type: "comment_on_issue" as const, targetIssueId, staleness: "lenient" as const, bodyMarkdown: "hello" }] }],
+      options,
+      // An idempotency retry must replay the exact signed authority bytes.
+      authority: authorityFor(options),
     };
     const [first, second] = await Promise.all([service().create(input), service().create(input)]);
     expect(second.id).toBe(first.id);
     expect(await db.select().from(decisions).where(eq(decisions.idempotencyKey, "concurrent-create"))).toHaveLength(1);
+  });
+
+  it("allows only a signed, selected parent authority subset for decision-sourced grants", async () => {
+    const options: DecisionOption[] = [{ id: "yes", label: "Yes", effects: [{
+      type: "comment_on_issue", targetIssueId, staleness: "lenient", bodyMarkdown: "follow-up",
+    }] }];
+    const parent = await service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Parent grant?", body: "Body", options,
+    });
+    await service().decide({ id: parent.id, optionId: "yes", decidedByUserId, userActor: boardActor() });
+    const sourceAuthority: DecisionAuthorityGrantV1 = {
+      ...parent.authority!,
+      issuer: { ...parent.authority!.issuer, source: { kind: "decision", id: parent.id } },
+    };
+
+    await expect(service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Constrained follow up?", body: "Body", options,
+      authority: sourceAuthority,
+    })).resolves.toMatchObject({
+      authority: expect.objectContaining({
+        targetIssueIds: parent.authority!.targetIssueIds,
+        capabilities: parent.authority!.capabilities,
+      }),
+    });
+
+    await expect(service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Missing parent?", body: "Body", options,
+      authority: { ...sourceAuthority, issuer: { ...sourceAuthority.issuer, source: { kind: "decision", id: randomUUID() } } },
+    })).rejects.toThrow("must be a valid subset");
+
+    const openParent = await service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Open parent?", body: "Body", options,
+    });
+    await expect(service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Unselected child?", body: "Body", options,
+      authority: { ...sourceAuthority, issuer: { ...sourceAuthority.issuer, source: { kind: "decision", id: openParent.id } } },
+    })).rejects.toThrow("must be a valid subset");
+
+    await expect(service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Expired widening?", body: "Body", options,
+      authority: { ...sourceAuthority, expiresAt: new Date(Date.parse(sourceAuthority.expiresAt) + 1_000).toISOString() },
+    })).rejects.toThrow("must be a valid subset");
+
+    await db.update(decisions).set({ title: "Tampered parent" }).where(eq(decisions.id, parent.id));
+    // Title is intentionally not part of the execution signature; mutate the
+    // signed options to prove parent HMAC validation gates delegation.
+    await db.update(decisions).set({ options: [{ id: "tampered", label: "Tampered", effects: [] }] }).where(eq(decisions.id, parent.id));
+    await expect(service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Tampered child?", body: "Body", options, authority: sourceAuthority,
+    })).rejects.toThrow("must be a valid subset");
+  });
+
+  it("does not let a delegated child shed a parent authority gate", async () => {
+    const options: DecisionOption[] = [{ id: "yes", label: "Yes", effects: [{
+      type: "comment_on_issue", targetIssueId, staleness: "lenient", bodyMarkdown: "gated",
+    }] }];
+    const evidence = evidencePair();
+    const gatedAuthority: DecisionAuthorityGrantV1 = {
+      ...authorityFor(options),
+      authorityClass: "execution_authority",
+      targetIssueIds: [targetIssueId],
+      capabilities: ["implementation"],
+      requiredExternalGates: ["github_actor"],
+    };
+    const gatedService = decisionService(db, {
+      wakeOriginAgent: async () => undefined,
+      loadDecisionEvidence: async () => structuredClone(evidence),
+    });
+    const parent = await gatedService.create({
+      companyId, actor: agentActor(), agentId, runId, title: "Gated parent?", body: "Body",
+      options, authority: gatedAuthority, ...evidence,
+    });
+    await gatedService.decide({ id: parent.id, optionId: "yes", decidedByUserId, userActor: boardActor() });
+
+    await expect(gatedService.create({
+      companyId, actor: agentActor(), agentId, runId, title: "Weakened child?", body: "Body",
+      options,
+      authority: {
+        ...parent.authority!,
+        issuer: { ...parent.authority!.issuer, source: { kind: "decision", id: parent.id } },
+        requiredExternalGates: [],
+      },
+      ...evidence,
+    })).rejects.toThrow("must be a valid subset");
+  });
+
+  it("rejects an authority issuer that differs from the authenticated origin-run user", async () => {
+    const options: DecisionOption[] = [{ id: "yes", label: "Yes", effects: [] }];
+    const authority = authorityFor(options);
+    await expect(service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Forged issuer?", body: "Body", options,
+      authority: { ...authority, issuer: { ...authority.issuer, userId: otherBoardUserId } },
+    })).rejects.toThrow("issuer and actor must match authenticated origin provenance");
   });
 
   it("executes once, replays stored outcome, and attributes executor audit to the decider", async () => {
@@ -150,6 +347,7 @@ describePg("decisionService", () => {
       companyId,
       sourceKind: "review",
       sourceId,
+      linkedIssueId: sourceId,
       expectedVersion: 1,
       activityAt: activityAt.toISOString(),
       reason: `Archive ${sourceId}`,
@@ -164,25 +362,91 @@ describePg("decisionService", () => {
         attentionArchive: entry,
       } satisfies AttentionArchiveTargetSnapshot,
     ]));
-    const created = await service().create({
+    const options: DecisionOption[] = [
+      { id: "archive", label: "Archive", style: "destructive", effects: [] },
+      { id: "keep", label: "Keep", effects: [] },
+    ];
+    const archiveInput = {
       companyId,
       actor: agentActor(),
       agentId,
       runId,
       title: "Archive two?",
       body: "Reviewed exact set",
-      options: [
-        { id: "archive", label: "Archive", style: "destructive", effects: [] },
-        { id: "keep", label: "Keep", effects: [] },
-      ],
+      options,
+      idempotencyKey: "archive-two-exact-manifest",
       metadata: { kind: "attention_archive_proposal", manifestHash: hashAttentionArchiveManifest(manifest) },
       additionalTargetSnapshots: snapshots,
+    };
+    const rawService = decisionService(db, { wakeOriginAgent: async (input) => { wakes.push(input); } });
+
+    await expect(rawService.create({
+      ...archiveInput,
+      authority: authorityFor(options),
+      idempotencyKey: "archive-design-authority-denied",
+    })).rejects.toThrow("Attention archive proposals require delivery authority over every linked issue target");
+    expect((await db.select().from(decisionRetention)).every((row) => row.archivedAt === null)).toBe(true);
+
+    const expired = await rawService.create({
+      ...archiveInput,
+      idempotencyKey: "archive-expired-recovery",
     });
-    const result = await service().decide({
+    const expiredAuthority: DecisionAuthorityGrantV1 = {
+      ...expired.authority!,
+      issuer: {
+        ...expired.authority!.issuer,
+        issuedAt: new Date(Date.now() - 120_000).toISOString(),
+      },
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    };
+    await db.update(decisions).set({
+      status: "decided",
+      executionStatus: "running",
+      chosenOptionId: "archive",
+      decidedByUserId: originResponsibleUserId,
+      decidedAt: new Date(Date.now() - 60_000),
+      updatedAt: new Date(Date.now() - 60_000),
+      authority: expiredAuthority,
+      signedSpec: signDecisionSpec({
+        decisionId: expired.id,
+        authority: expiredAuthority,
+        technicalEvidence: expired.technicalEvidence,
+        externalEnforcement: expired.externalEnforcement,
+        options: expired.options,
+        inputs: expired.inputs,
+        targetSnapshots: expired.targetSnapshots,
+      }),
+    }).where(eq(decisions.id, expired.id));
+    process.env.PAPERCLIP_DECISIONS_RECOVERY_GRACE_MS = "0";
+    await rawService.sweepExpired();
+    expect(await rawService.outcome(expired.id)).toMatchObject({
+      executionStatus: "blocked",
+      metadata: {
+        archiveProposalError: "deny_decision_authority",
+        governanceBlockedReason: "deny_decision_authority",
+        authorityReason: "authority_expired",
+      },
+    });
+    expect((await db.select().from(decisionRetention)).every((row) => row.archivedAt === null)).toBe(true);
+
+    const created = await rawService.create(archiveInput);
+    const replay = await rawService.create(archiveInput);
+    expect(replay.id).toBe(created.id);
+    expect(created.authority).toMatchObject({
+      authorityClass: "execution_authority",
+      capabilities: ["delivery"],
+      targetIssueIds: expect.arrayContaining([targetIssueId, extraIssueId]),
+    });
+    expect(created.authority?.targetIssueIds).toHaveLength(2);
+
+    const result = await rawService.decide({
       id: created.id,
       optionId: "archive",
-      decidedByUserId,
-      userActor: boardActor(),
+      decidedByUserId: originResponsibleUserId,
+      userActor: {
+        ...boardActor(),
+        userId: originResponsibleUserId,
+      },
     });
     expect(result.executionStatus).toBe("succeeded");
     const states = await db.select().from(decisionRetention);
@@ -197,10 +461,130 @@ describePg("decisionService", () => {
     expect(staleResult.executions[0]).toMatchObject({ status: "skipped", error: "target_changed" });
 
     const denied = await createCommentDecision("lenient", { idempotencyKey: "denied" });
-    const deniedResult = await service().decide({ id: denied.id, optionId: "yes", decidedByUserId, userActor: { type: "none", source: "none" } });
+    const deniedResult = await service().decide({ id: denied.id, optionId: "yes", decidedByUserId,
+      userActor: { type: "board", userId: decidedByUserId, companyIds: [], memberships: [], source: "session" } });
     expect(deniedResult.executions[0]).toMatchObject({ status: "failed", error: "deny_decision_intersection" });
     const failedAudit = await db.select().from(activityLog).where(eq(activityLog.action, "decision.effect_failed"));
     expect(failedAudit.at(-1)?.details).toMatchObject({ reason: "deny_decision_intersection" });
+  });
+
+  it("preserves effect-time governance denial evidence through terminal status and continuation delivery", async () => {
+    const options: DecisionOption[] = [{ id: "yes", label: "Yes", effects: [{
+      type: "comment_on_issue", targetIssueId, staleness: "lenient", bodyMarkdown: "must not run",
+    }] }];
+    const authority: DecisionAuthorityGrantV1 = {
+      ...authorityFor(options),
+      authorityClass: "execution_authority",
+      capabilities: ["delivery"],
+      requiredExternalGates: ["required_checks"],
+    };
+    const signedEvidence = evidencePair();
+    const deniedEnforcement = structuredClone(signedEvidence.externalEnforcement);
+    deniedEnforcement.allowed = false;
+    deniedEnforcement.gates.find((gate) => gate.type === "required_checks")!.status = "failed";
+    let evidenceLoadCount = 0;
+    const governedService = decisionService(db, {
+      wakeOriginAgent: async (input) => { wakes.push(input); },
+      loadDecisionEvidence: async () => {
+        evidenceLoadCount += 1;
+        return {
+          technicalEvidence: structuredClone(signedEvidence.technicalEvidence),
+          externalEnforcement: evidenceLoadCount === 1
+            ? structuredClone(signedEvidence.externalEnforcement)
+            : deniedEnforcement,
+        };
+      },
+    });
+    const created = await governedService.create({
+      companyId, actor: agentActor(), agentId, runId, title: "Ship?", body: "Body",
+      continuationPolicy: "wake_origin_agent", options, authority, ...signedEvidence,
+    });
+
+    const result = await governedService.decide({
+      id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor(),
+    });
+
+    expect(result.executionStatus).toBe("blocked");
+    expect(result.latestEnforcementResult).toMatchObject({ allowed: false });
+    expect(result.metadata).toMatchObject({
+      governanceBlockedReason: "external_enforcement_denied",
+      governanceBlockedAt: expect.any(String),
+      continuationPending: false,
+    });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(0);
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "decided" }]);
+  });
+
+  it("signs the provider-resolved evidence bytes and rejects unavailable provider verification", async () => {
+    const options: DecisionOption[] = [{ id: "yes", label: "Yes", effects: [{
+      type: "comment_on_issue", targetIssueId, staleness: "lenient", bodyMarkdown: "verified",
+    }] }];
+    const provider = evidencePair();
+    const submitted = structuredClone(provider);
+    submitted.technicalEvidence.observedAt = new Date(Date.now() - 5 * 60_000).toISOString();
+    submitted.externalEnforcement.evaluatedAt = new Date(Date.now() - 4 * 60_000).toISOString();
+    submitted.externalEnforcement.gates[0]!.evidenceIds = ["caller:invented-proof"];
+    provider.externalEnforcement.gates[0]!.evidenceIds = ["github:user:maintainer"];
+    let providerLoads = 0;
+    const authority: DecisionAuthorityGrantV1 = {
+      ...authorityFor(options),
+      authorityClass: "execution_authority",
+      targetIssueIds: [targetIssueId],
+      capabilities: ["implementation"],
+      requiredExternalGates: ["required_checks"],
+    };
+    const verifiedService = decisionService(db, {
+      wakeOriginAgent: async () => undefined,
+      loadDecisionEvidence: async () => {
+        providerLoads += 1;
+        const snapshot = structuredClone(provider);
+        if (providerLoads > 1) {
+          snapshot.technicalEvidence.observedAt = new Date(Date.parse(snapshot.technicalEvidence.observedAt) + 1_000).toISOString();
+          snapshot.externalEnforcement.evaluatedAt = new Date(Date.parse(snapshot.externalEnforcement.evaluatedAt) + 1_000).toISOString();
+        }
+        return snapshot;
+      },
+    });
+
+    const createInput = {
+      companyId, actor: agentActor(), agentId, runId, title: "Verified evidence?", body: "Body",
+      options, authority, idempotencyKey: "verified-evidence-retry", ...submitted,
+    };
+    const created = await verifiedService.create(createInput);
+    const replay = await verifiedService.create(createInput);
+
+    expect(replay.id).toBe(created.id);
+    expect(providerLoads).toBe(1);
+    expect(await db.select().from(decisions).where(eq(decisions.idempotencyKey, "verified-evidence-retry"))).toHaveLength(1);
+    expect(created.technicalEvidence).toEqual(provider.technicalEvidence);
+    expect(created.externalEnforcement).toEqual(provider.externalEnforcement);
+    expect(created.externalEnforcement).not.toEqual(submitted.externalEnforcement);
+
+    const changedEvidence = structuredClone(submitted);
+    changedEvidence.externalEnforcement.gates[0]!.evidenceIds = ["caller:changed-proof"];
+    await expect(verifiedService.create({ ...createInput, ...changedEvidence }))
+      .rejects.toThrow("Decision idempotency key already used with a different payload");
+    expect(providerLoads).toBe(1);
+
+    await expect(decisionService(db, { wakeOriginAgent: async () => undefined }).create({
+      companyId, actor: agentActor(), agentId, runId, title: "Unavailable evidence?", body: "Body",
+      options, authority, ...submitted,
+    })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "evidence_unavailable" }),
+    });
+  });
+
+  it("does not let a different authenticated session ride the signed issuer identity", async () => {
+    const created = await createCommentDecision();
+    await expect(service().decide({
+      id: created.id,
+      optionId: "yes",
+      decidedByUserId,
+      userActor: { ...boardActor(), userId: otherBoardUserId },
+    })).rejects.toThrow("does not own the authority issuer identity");
+    expect((await service().get(created.id))?.status).toBe("open");
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(0);
   });
 
   it("fails closed when the origin actor retains read access but loses mutation access", async () => {
@@ -281,7 +665,7 @@ describePg("decisionService", () => {
 
     const cancelDecision = await service().create({
       companyId, actor: agentActor(), agentId, runId, title: "Cancel?", body: "Body",
-      options: [{ id: "yes", label: "Yes", effects: [{ type: "cancel_issue_tree", targetIssueId, staleness: "strict", reasonComment: "cleanup" }] }],
+      options: [{ id: "yes", label: "Yes", style: "destructive", effects: [{ type: "cancel_issue_tree", targetIssueId, staleness: "strict", reasonComment: "cleanup" }] }],
     });
     const childId = randomUUID();
     await db.insert(issues).values({ id: childId, companyId, title: "New child", status: "todo", priority: "medium", parentId: targetIssueId, responsibleUserId: decidedByUserId });
@@ -290,25 +674,19 @@ describePg("decisionService", () => {
     expect((await db.select().from(issues).where(eq(issues.id, childId)))[0]?.status).toBe("todo");
   });
 
-  it("never expands a lenient cancellation beyond the signed descendant scope", async () => {
+  it("rejects lenient cancellation before signing", async () => {
     const reviewedChildId = randomUUID();
     await db.insert(issues).values({ id: reviewedChildId, companyId, title: "Reviewed child", status: "todo", priority: "medium",
       parentId: targetIssueId, responsibleUserId: decidedByUserId });
-    const created = await service().create({
+    await expect(service().create({
       companyId, actor: agentActor(), agentId, runId, title: "Cancel?", body: "Body",
-      options: [{ id: "yes", label: "Yes", effects: [{
+      options: [{ id: "yes", label: "Yes", style: "destructive", effects: [{
         type: "cancel_issue_tree", targetIssueId, staleness: "lenient", reasonComment: "cleanup",
       }] }],
+    })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ code: "invalid_decision_governance" }),
     });
-    const unreviewedChildId = randomUUID();
-    await db.insert(issues).values({ id: unreviewedChildId, companyId, title: "Unreviewed child", status: "todo", priority: "medium",
-      parentId: targetIssueId, responsibleUserId: decidedByUserId });
-
-    const result = await service().decide({ id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor() });
-
-    expect(result.executions[0]).toMatchObject({ status: "executed",
-      result: { cancelledIssueIds: [reviewedChildId, targetIssueId] } });
-    expect((await db.select().from(issues).where(eq(issues.id, unreviewedChildId)))[0]?.status).toBe("todo");
   });
 
   it("bounds cyclic issue traversal for snapshots and cancel-tree execution", async () => {
@@ -371,6 +749,37 @@ describePg("decisionService", () => {
     }
   });
 
+  it("keeps pre-governance rows read-only except for authenticated safe dismissal", async () => {
+    const created = await createCommentDecision();
+    const legacySignature = signDecisionSpec({
+      decisionId: created.id,
+      options: created.options,
+      targetSnapshots: created.targetSnapshots,
+    });
+    await db.update(decisions).set({
+      authority: null,
+      technicalEvidence: null,
+      externalEnforcement: null,
+      signedSpec: legacySignature,
+    }).where(eq(decisions.id, created.id));
+
+    await expect(service().decide({
+      id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor(),
+    })).rejects.toThrow("Decision has invalid or legacy read-only authority");
+    const dismissed = await service().dismiss(created.id, decidedByUserId, boardActor(), "No");
+    expect(dismissed).toMatchObject({
+      status: "decided",
+      executionStatus: "succeeded",
+      chosenOptionId: "dismissed",
+      metadata: { dismissed: true, dismissReason: "No" },
+    });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(0);
+    expect(await db.select().from(decisionEffectExecutions).where(eq(decisionEffectExecutions.decisionId, created.id))).toHaveLength(0);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "decision.dismissed")))
+      .toEqual([expect.objectContaining({ entityId: created.id, responsibleUserId: decidedByUserId })]);
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "decided" }]);
+  });
+
   it("signs and verifies with an auto-generated key when no secret is configured", async () => {
     const originalHome = process.env.PAPERCLIP_HOME;
     const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-decision-generated-"));
@@ -425,6 +834,98 @@ describePg("decisionService", () => {
     expect(await service().sweepExpired()).toEqual({ expired: 0, resumed: 1 });
     expect((await service().get(created.id))?.executionStatus).toBe("succeeded");
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(1);
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "decided" }]);
+  });
+
+  it("audits and wakes exactly once when a direct decision attempt finds expired authority", async () => {
+    const created = await createCommentDecision();
+    const expiredAuthority: DecisionAuthorityGrantV1 = {
+      ...created.authority!,
+      issuer: {
+        ...created.authority!.issuer,
+        issuedAt: new Date(Date.now() - 120_000).toISOString(),
+      },
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    };
+    await db.update(decisions).set({
+      authority: expiredAuthority,
+      expiresAt: new Date(Date.now() - 30_000),
+      signedSpec: signDecisionSpec({
+        decisionId: created.id,
+        authority: expiredAuthority,
+        technicalEvidence: created.technicalEvidence,
+        externalEnforcement: created.externalEnforcement,
+        options: created.options,
+        inputs: created.inputs,
+        targetSnapshots: created.targetSnapshots,
+      }),
+    }).where(eq(decisions.id, created.id));
+
+    await expect(service().decide({
+      id: created.id,
+      optionId: "yes",
+      decidedByUserId,
+      userActor: boardActor(),
+    })).rejects.toThrow("decision_authority_expired");
+
+    expect(await service().get(created.id)).toMatchObject({
+      status: "expired",
+      metadata: {
+        expiredReason: "authority_expired",
+        authorityReason: "authority_expired",
+        governanceBlockedReason: "deny_decision_authority",
+        governanceBlockedAt: expect.any(String),
+        continuationPending: false,
+      },
+    });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(0);
+    expect(await db.select().from(decisionEffectExecutions).where(eq(decisionEffectExecutions.decisionId, created.id)))
+      .toHaveLength(0);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "decision.expired")))
+      .toEqual([expect.objectContaining({
+        entityId: created.id,
+        details: expect.objectContaining({
+          expiredReason: "authority_expired",
+        }),
+      })]);
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "expired" }]);
+
+    expect(await service().sweepExpired()).toEqual({ expired: 0, resumed: 0 });
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "decision.expired"))).toHaveLength(1);
+    expect(wakes).toHaveLength(1);
+  });
+
+  it("fails closed when recovery encounters a tampered signed decision", async () => {
+    process.env.PAPERCLIP_DECISIONS_RECOVERY_GRACE_MS = "0";
+    const created = await createCommentDecision();
+    await db.update(decisions).set({
+      status: "decided",
+      executionStatus: "running",
+      chosenOptionId: "yes",
+      decidedByUserId,
+      inputValues: {},
+      authority: { ...created.authority!, expiresAt: new Date(Date.now() + 13 * 86_400_000).toISOString() },
+      updatedAt: new Date(Date.now() - 1_000),
+    }).where(eq(decisions.id, created.id));
+    await db.insert(decisionEffectExecutions).values({
+      decisionId: created.id,
+      effectIndex: 0,
+      effectType: "comment_on_issue",
+      targetIssueId,
+      status: "claimed",
+    });
+
+    await expect(service().sweepExpired()).resolves.toEqual({ expired: 0, resumed: 1 });
+
+    const recovered = await service().get(created.id);
+    expect(recovered).toMatchObject({ executionStatus: "blocked" });
+    expect(recovered?.metadata).toMatchObject({
+      governanceBlockedReason: "deny_decision_signature",
+      continuationPending: false,
+    });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(0);
+    expect(await db.select().from(decisionEffectExecutions).where(eq(decisionEffectExecutions.decisionId, created.id)))
+      .toEqual([expect.objectContaining({ status: "failed", error: "deny_decision_signature" })]);
     expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "decided" }]);
   });
 
@@ -633,8 +1134,19 @@ describePg("decisionService", () => {
       .toEqual([expect.objectContaining({ entityId: rejected.id, responsibleUserId: decidedByUserId })]);
   });
 
-  it("rejects a direct dismissal when the signed decision spec was tampered with", async () => {
+  it("rejects a legacy safe dismissal when the signed decision spec was tampered with", async () => {
     const created = await createCommentDecision();
+    const legacySignature = signDecisionSpec({
+      decisionId: created.id,
+      options: created.options,
+      targetSnapshots: created.targetSnapshots,
+    });
+    await db.update(decisions).set({
+      authority: null,
+      technicalEvidence: null,
+      externalEnforcement: null,
+      signedSpec: legacySignature,
+    }).where(eq(decisions.id, created.id));
     await db.update(decisions).set({ options: [{ id: "tampered", label: "Tampered", effects: [{
       type: "comment_on_issue", targetIssueId, staleness: "lenient", bodyMarkdown: "tampered",
     }] }] }).where(eq(decisions.id, created.id));

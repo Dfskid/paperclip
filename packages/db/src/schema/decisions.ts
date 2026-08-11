@@ -1,4 +1,10 @@
-import type { DecisionInput, DecisionOption } from "@paperclipai/shared";
+import type {
+  DecisionAuthorityGrantV1,
+  DecisionInput,
+  DecisionOption,
+  DecisionTechnicalEvidenceV1,
+  ExternalEnforcementEvidenceV1,
+} from "@paperclipai/shared";
 import { sql } from "drizzle-orm";
 import {
   index,
@@ -46,6 +52,10 @@ export const decisions = pgTable(
     ruleKey: text("rule_key"),
     title: text("title").notNull(),
     body: text("body").notNull(),
+    authority: jsonb("authority").$type<DecisionAuthorityGrantV1>(),
+    technicalEvidence: jsonb("technical_evidence").$type<DecisionTechnicalEvidenceV1>(),
+    externalEnforcement: jsonb("external_enforcement").$type<ExternalEnforcementEvidenceV1>(),
+    latestEnforcementResult: jsonb("latest_enforcement_result").$type<ExternalEnforcementEvidenceV1>(),
     options: jsonb("options").$type<DecisionOption[]>().notNull(),
     inputs: jsonb("inputs").$type<DecisionInput[]>(),
     status: text("status").notNull().default("open"),

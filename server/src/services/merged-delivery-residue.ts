@@ -4,7 +4,6 @@ import { issueWorkProducts, issues } from "@paperclipai/db";
 import { DELIVERY_RESIDUE_ORIGIN_KINDS, isUuidLike } from "@paperclipai/shared";
 import {
   createPullRequestMergeDetailsResolver,
-  extractGitHubPullRequestReferences,
   type GitHubPullRequestReference,
   type PullRequestMergeDetailsResolver,
 } from "./github-pull-request-merge.js";
@@ -40,6 +39,23 @@ function externalIdReference(value: string | null): GitHubPullRequestReference[]
   return [{ host: "github.com", owner: match[1]!, repo: match[2]!, number: Number(match[3]) }];
 }
 
+function structuredUrlReference(value: string | null): GitHubPullRequestReference[] {
+  if (!value) return [];
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return [];
+  }
+  const host = parsed.host.toLowerCase();
+  if (parsed.protocol !== "https:" || (host !== "github.com" && host !== "www.github.com")) return [];
+  const match = /^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([1-9][0-9]*)\/?$/.exec(parsed.pathname);
+  if (!match) return [];
+  const number = Number(match[3]);
+  if (!Number.isSafeInteger(number)) return [];
+  return [{ host: "github.com", owner: match[1]!, repo: match[2]!, number }];
+}
+
 /**
  * Resolves only explicit structured pull-request work products. Prose, issue
  * titles, branch names, and local Git state are intentionally excluded.
@@ -51,7 +67,7 @@ export function structuredPullRequestReference(
   for (const product of products) {
     if (product.provider.toLowerCase() !== "github") return null;
     const candidates = [
-      ...extractGitHubPullRequestReferences([product.url]),
+      ...structuredUrlReference(product.url),
       ...externalIdReference(product.externalId),
     ];
     if (candidates.length === 0) return null;

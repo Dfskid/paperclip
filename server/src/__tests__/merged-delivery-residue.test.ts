@@ -64,6 +64,16 @@ describe("structured merged-delivery references", () => {
     ["non-GitHub provider", [{ provider: "gitlab", externalId: "paperclipai/paperclip#321", url: pullRequestUrl }]],
     ["missing structured identity", [{ provider: "github", externalId: null, url: null }]],
     ["conflicting identity", [{ provider: "github", externalId: "paperclipai/paperclip#322", url: pullRequestUrl }]],
+    ["a GitHub pull request embedded in a foreign-host URL", [{
+      provider: "github",
+      externalId: null,
+      url: "https://evil.example/https://github.com/paperclipai/paperclip/pull/321",
+    }]],
+    ["a malformed pull-request number suffix", [{
+      provider: "github",
+      externalId: null,
+      url: "https://github.com/paperclipai/paperclip/pull/321-not-a-pr",
+    }]],
     ["ambiguous references", [
       { provider: "github", externalId: null, url: pullRequestUrl },
       { provider: "github", externalId: null, url: "https://github.com/paperclipai/paperclip/pull/322" },
@@ -389,6 +399,40 @@ describeEmbeddedPostgres("merged-delivery residue consolidation", () => {
 
     await expect(db.select({ id: issueWorkProducts.id, isPrimary: issueWorkProducts.isPrimary }).from(issueWorkProducts).where(eq(issueWorkProducts.issueId, residueIssueId)))
       .resolves.toEqual([{ id: prior!.id, isPrimary: true }]);
+    await expect(db.select({ originKind: issues.originKind, originId: issues.originId }).from(issues).where(eq(issues.id, residueIssueId)))
+      .resolves.toEqual([{ originKind: "manual", originId: null }]);
+    await expect(db.select().from(activityLog).where(eq(activityLog.action, "delivery.residue_linked")))
+      .resolves.toHaveLength(0);
+  });
+
+  it("rolls back a malformed structured URL without stamping origin or audit provenance", async () => {
+    const { companyId, sourceIssueId } = await seedCompanyAndSource();
+    const residueIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: residueIssueId,
+      companyId,
+      title: "Courier",
+      status: "todo",
+      originKind: "manual",
+    });
+    const service = mergedDeliveryResidueService(db);
+
+    await expect(service.createLinkedWorkProduct({
+      companyId,
+      residueIssueId,
+      sourceIssueId,
+      originKind: "delivery_courier",
+      workProduct: {
+        type: "pull_request",
+        provider: "github",
+        title: "Malformed PR URL",
+        url: "https://evil.example/https://github.com/paperclipai/paperclip/pull/321",
+        status: "open",
+      },
+    })).rejects.toThrow("same structured pull request");
+
+    await expect(db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, residueIssueId)))
+      .resolves.toHaveLength(0);
     await expect(db.select({ originKind: issues.originKind, originId: issues.originId }).from(issues).where(eq(issues.id, residueIssueId)))
       .resolves.toEqual([{ originKind: "manual", originId: null }]);
     await expect(db.select().from(activityLog).where(eq(activityLog.action, "delivery.residue_linked")))

@@ -1040,9 +1040,19 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     for (let index = 0; index < option.effects.length; index += 1) await executeEffect(decision, option.effects[index]!, index, userActor, decision.decidedByUserId, run?.responsibleUserId ?? null);
     const rows = await db.select().from(decisionEffectExecutions).where(eq(decisionEffectExecutions.decisionId, decision.id));
     const successful = rows.filter((row) => row.status === "executed").length;
-    const status = rows.every((row) => row.status === "executed") ? "succeeded" : successful ? "partial" : "failed";
-    await db.update(decisions).set({ executionStatus: status, updatedAt: new Date(), metadata: { ...decision.metadata,
-      ...(decision.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } }).where(eq(decisions.id, decision.id));
+    const blockedReasons = new Set(["evidence_expired", "evidence_unavailable", "evidence_unparsable", "evidence_drifted", "external_enforcement_denied"]);
+    const evidenceBlocked = rows.some((row) => row.error && blockedReasons.has(row.error));
+    const status = evidenceBlocked ? "blocked" : rows.every((row) => row.status === "executed") ? "succeeded" : successful ? "partial" : "failed";
+    await db.update(decisions).set({
+      executionStatus: status,
+      updatedAt: new Date(),
+      ...(decision.continuationPolicy === "wake_origin_agent" ? {
+        // Effect-time governance writes happen in an earlier transaction. Merge
+        // the continuation marker into the current JSONB value so those fresh
+        // denial facts cannot be erased by this stale in-memory decision row.
+        metadata: sql`coalesce(${decisions.metadata}, '{}'::jsonb) || jsonb_build_object('continuationPending', true)`,
+      } : {}),
+    }).where(eq(decisions.id, decision.id));
     return outcome(decision.id);
   }
 

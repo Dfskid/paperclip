@@ -19,6 +19,7 @@ import {
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
+  DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   productivityReviewService,
@@ -878,6 +879,145 @@ describeEmbeddedPostgres("productivity review service", () => {
       .where(eq(activityLog.action, "issue.productivity_review_continuation_held"));
     expect(activities).toHaveLength(1);
     expect(activities[0]?.entityId).toBe(seeded.issueId);
+  });
+
+  it("suppresses re-creation using the company-configured snooze when set", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+
+    await db
+      .update(companies)
+      .set({ productivityReviewResolvedSnoozeMs: 4 * 60 * 60 * 1000 })
+      .where(eq(companies.id, seeded.companyId));
+
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await seedTerminalReview(seeded, {
+      status: "done",
+      createdAt: new Date(now.getTime() - (25 * 60 * 60 * 1000)),
+      updatedAt: new Date(now.getTime() - (2 * 60 * 60 * 1000)),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.snoozed).toBe(1);
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+  });
+
+  it("creates a new review once the company-configured snooze window expires", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+
+    await db
+      .update(companies)
+      .set({ productivityReviewResolvedSnoozeMs: 60 * 60 * 1000 })
+      .where(eq(companies.id, seeded.companyId));
+
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await seedTerminalReview(seeded, {
+      status: "done",
+      createdAt: new Date(now.getTime() - 25 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.snoozed).toBe(0);
+    expect(result.created).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(2);
+  });
+
+  it("uses the global 24h default when no company-specific snooze is configured", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await seedTerminalReview(seeded, {
+      status: "done",
+      createdAt: new Date(now.getTime() - (24 * 60 * 60 * 1000 + 11_000)),
+      updatedAt: new Date(now.getTime() - (23 * 60 * 60 * 1000 + 47 * 60 * 1000)),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.snoozed).toBe(1);
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+  });
+
+  it("two companies with different snooze settings each respect their own", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+
+    const customSeeded = await seedAssignedIssue();
+    await db
+      .update(companies)
+      .set({ productivityReviewResolvedSnoozeMs: 1 * 60 * 60 * 1000 })
+      .where(eq(companies.id, customSeeded.companyId));
+    await insertRuns({
+      companyId: customSeeded.companyId,
+      agentId: customSeeded.coderId,
+      issueId: customSeeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await seedTerminalReview(customSeeded, {
+      status: "done",
+      createdAt: new Date(now.getTime() - (25 * 60 * 60 * 1000)),
+      updatedAt: new Date(now.getTime() - (2 * 60 * 60 * 1000)),
+    });
+
+    const defaultSeeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: defaultSeeded.companyId,
+      agentId: defaultSeeded.coderId,
+      issueId: defaultSeeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await seedTerminalReview(defaultSeeded, {
+      status: "done",
+      createdAt: new Date(now.getTime() - (2 * 60 * 60 * 1000)),
+      updatedAt: new Date(now.getTime() - (30 * 60 * 1000)),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now });
+
+    expect(result.scanned).toBe(2);
+    expect(result.snoozed).toBe(1);
+    expect(result.created).toBe(1);
+
+    const customReviews = await listProductivityReviews(customSeeded.companyId);
+    expect(customReviews).toHaveLength(2);
+
+    const defaultReviews = await listProductivityReviews(defaultSeeded.companyId);
+    expect(defaultReviews).toHaveLength(1);
   });
 
   it("clamps poisoned requestDepth metadata instead of aborting productivity reconciliation", async () => {

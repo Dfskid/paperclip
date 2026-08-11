@@ -16,6 +16,16 @@ const resolveIssue = (id: string): DecisionIssueRef | null => ISSUES[id] ?? null
 const cancelTreePreview = () => [ISSUES["issue-target"]!, ISSUES["issue-child-1"]!, ISSUES["issue-child-2"]!];
 
 const originIssue = ISSUES["issue-origin"]!;
+const defaultAuthority: NonNullable<Decision["authority"]> = {
+  schemaVersion: 1,
+  authorityClass: "execution_authority",
+  issuer: { userId: "board-user", source: { kind: "issue", id: "issue-origin" }, issuedAt: "2026-07-22T08:00:00Z" },
+  actor: { kind: "agent", id: "agent-gardener" },
+  targetIssueIds: ["issue-target"],
+  capabilities: ["implementation", "delivery"],
+  expiresAt: "2026-07-29T12:00:00Z",
+  requiredExternalGates: [],
+};
 
 function mkDecision(overrides: Partial<Decision> = {}): Decision {
   return {
@@ -28,6 +38,10 @@ function mkDecision(overrides: Partial<Decision> = {}): Decision {
     ruleKey: "stale-epic-sweep",
     title: "Stale epic PAP-456 hasn’t moved in 21 days",
     body: "PAP-456 and its two sub-issues have had no activity for three weeks. Cancel the tree, or keep it and I’ll snooze for another week.",
+    authority: defaultAuthority,
+    technicalEvidence: null,
+    externalEnforcement: null,
+    latestEnforcementResult: null,
     options: [
       {
         id: "keep",
@@ -123,6 +137,17 @@ export const Pending: Story = {
           ],
         },
       ],
+    }),
+  },
+};
+
+export const LegacyReadOnly: Story = {
+  args: {
+    ...shared,
+    decision: mkDecision({
+      authority: null,
+      title: "Legacy decision without an authority grant",
+      body: "This pre-governance decision is readable but cannot execute effects. Close it and re-propose with signed authority.",
     }),
   },
 };

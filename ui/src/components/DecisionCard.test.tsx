@@ -62,7 +62,7 @@ function mkDecision(overrides: Partial<Decision> = {}): Decision {
       actor: { kind: "user", id: "board-user" },
       targetIssueIds: ["issue-target"],
       capabilities: [],
-      expiresAt: "2026-07-29T08:00:00Z",
+      expiresAt: "2026-07-29T12:00:00Z",
       requiredExternalGates: [],
     },
     technicalEvidence: null,
@@ -160,7 +160,7 @@ describe("DecisionCard", () => {
           actor: { kind: "agent", id: "agent-gardener" },
           targetIssueIds: ["issue-target"],
           capabilities: ["delivery", "merge"],
-          expiresAt: "2026-07-29T08:00:00Z",
+          expiresAt: "2026-07-29T12:00:00Z",
           requiredExternalGates: ["codeowners_review", "required_checks", "exact_head", "merge_gate"],
         },
         externalEnforcement: {

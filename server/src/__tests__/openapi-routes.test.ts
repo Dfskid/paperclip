@@ -215,6 +215,13 @@ describe("openapi routes", () => {
       decideBy: { nullable: true },
       snoozedUntil: { type: "string", format: "date-time", nullable: true },
     });
+    const createDecision = res.body.paths["/api/companies/{companyId}/decisions"].post;
+    expect(createDecision.responses["422"]).toBeDefined();
+    expect(createDecision.requestBody.content["application/json"].schema.required).toContain("authority");
+    expect(createDecision.requestBody.content["application/json"].schema.properties.authority).toBeDefined();
+    expect(createDecision.requestBody.content["application/json"].schema.properties.technicalEvidence).toBeDefined();
+    expect(createDecision.requestBody.content["application/json"].schema.properties.externalEnforcement).toBeDefined();
+    expect(res.body.paths["/api/companies/{companyId}/decision-bundles"].post.responses["422"]).toBeDefined();
     expect(JSON.stringify(res.body.paths["/api/tool-gateway/tools"].get)).not.toContain("sessionToken");
     expect(JSON.stringify(res.body.paths["/api/tool-gateway/tools/call"].post)).not.toContain("sessionToken");
   });

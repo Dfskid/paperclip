@@ -1254,7 +1254,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       .where(and(eq(decisions.continuationPolicy, "wake_origin_agent"),
         sql`${decisions.metadata} ->> 'continuationPending' = 'true'`,
         or(inArray(decisions.status, ["expired", "cancelled"]), and(eq(decisions.status, "decided"),
-          inArray(decisions.executionStatus, ["succeeded", "partial", "failed"])))))
+          inArray(decisions.executionStatus, ["succeeded", "partial", "failed", "blocked"])))))
       .orderBy(asc(decisions.updatedAt)).limit(batchSize);
     for (const decision of pendingContinuations) {
       await deliverContinuation(decision, decision.status === "expired" ? "expired" : decision.status === "cancelled" ? "cancelled" : "decided");

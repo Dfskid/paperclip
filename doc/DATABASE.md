@@ -192,10 +192,6 @@ This policy makes training exports self-describing while keeping the decision re
 
 The `decisions` table stores four governance documents as JSONB: `authority`, `technical_evidence`, `external_enforcement`, and `latest_enforcement_result`. `authority` distinguishes design approval from execution authority and carries the issuer, source, validity window, actor, target set, capabilities, and required gates. `technical_evidence` and the authority fields are covered by the decision's signed specification and signature; the latest enforcement result remains separate so effect-time revalidation cannot rewrite the approved evidence.
 
-Technical evidence binds the exact repository, pull request, base/head/merge state, checks, and reviews. Its environment fingerprint is derived from GitHub deployments for the exact head, its configuration fingerprint from normalized repository merge configuration and pull-request state, and its branch-rules fingerprint from normalized protection for the base branch. Provider unavailability, incomplete evidence, expiry, parse failure, or fingerprint drift produces a recorded denial rather than an inferred pass.
-
-Merged-delivery residue consolidation adds no parallel history table. It uses existing issue origin metadata and structured pull-request work products, moves only matching active residue to a terminal status, and records the immutable provider merge envelope plus retired issue IDs in `activity_log`. Existing issue, comment, run, and work-product rows remain intact.
-
 ## Decision queues and triage provenance
 
 The decisions desk stores queue membership, decide-by/snooze state, and retention state in `decision_queues`, `decision_queue_items`, `decision_triage`, and `decision_retention`. These sidecars use the stable attention identity `(source_kind, source_id)` so all attention source kinds can participate without copying source titles, bodies, projects, or other visibility-sensitive data.

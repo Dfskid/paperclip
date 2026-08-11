@@ -515,6 +515,53 @@ describePg("decisionService", () => {
     expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "decided" }]);
   });
 
+  it("retries a blocked continuation after a crash between governance denial and wake delivery", async () => {
+    const options: DecisionOption[] = [{ id: "yes", label: "Yes", effects: [{
+      type: "comment_on_issue", targetIssueId, staleness: "lenient", bodyMarkdown: "must not run",
+    }] }];
+    const authority: DecisionAuthorityGrantV1 = {
+      ...authorityFor(options),
+      authorityClass: "execution_authority",
+      capabilities: ["delivery"],
+      requiredExternalGates: ["required_checks"],
+    };
+    const signedEvidence = evidencePair();
+    const deniedEnforcement = structuredClone(signedEvidence.externalEnforcement);
+    deniedEnforcement.allowed = false;
+    deniedEnforcement.gates.find((gate) => gate.type === "required_checks")!.status = "failed";
+    let evidenceLoadCount = 0;
+    const crashingService = decisionService(db, {
+      wakeOriginAgent: async () => { throw new Error("simulated blocked-continuation crash"); },
+      loadDecisionEvidence: async () => {
+        evidenceLoadCount += 1;
+        return {
+          technicalEvidence: structuredClone(signedEvidence.technicalEvidence),
+          externalEnforcement: evidenceLoadCount === 1
+            ? structuredClone(signedEvidence.externalEnforcement)
+            : deniedEnforcement,
+        };
+      },
+    });
+    const created = await crashingService.create({
+      companyId, actor: agentActor(), agentId, runId, title: "Ship?", body: "Body",
+      continuationPolicy: "wake_origin_agent", options, authority, ...signedEvidence,
+    });
+
+    await expect(crashingService.decide({
+      id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor(),
+    })).rejects.toThrow("simulated blocked-continuation crash");
+    expect(await service().get(created.id)).toMatchObject({
+      executionStatus: "blocked",
+      metadata: { continuationPending: true },
+    });
+
+    await expect(service().sweepExpired()).resolves.toEqual({ expired: 0, resumed: 0 });
+
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "decided" }]);
+    expect((await service().get(created.id))?.metadata).toMatchObject({ continuationPending: false });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(0);
+  });
+
   it("signs the provider-resolved evidence bytes and rejects unavailable provider verification", async () => {
     const options: DecisionOption[] = [{ id: "yes", label: "Yes", effects: [{
       type: "comment_on_issue", targetIssueId, staleness: "lenient", bodyMarkdown: "verified",

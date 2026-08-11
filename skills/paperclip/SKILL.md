@@ -304,18 +304,7 @@ Create a decision from an issue-scoped agent run with `POST /api/companies/{comp
 - Each origin agent may have at most 50 open decisions by default.
 - Pre-governance decisions with no authority are legacy read-only records. An authenticated board member may safely dismiss one (no option effects run); otherwise cancel and re-propose it with explicit authority.
 
-For a GitHub-affecting `merge` or `deploy` grant, first call `POST /api/companies/{companyId}/decision-evidence/preview`:
-
-```json
-{
-  "repository": { "owner": "paperclipai", "name": "paperclip" },
-  "pullRequestNumber": 321,
-  "actor": "{githubLogin}",
-  "expiresAt": "{evidenceExpiryIso}"
-}
-```
-
-Copy the returned `technicalEvidence` and `externalEnforcement` objects unchanged into the decision create request, and require all six gates in the authority: `github_actor`, `codeowners_review`, `branch_protection`, `required_checks`, `exact_head`, and `merge_gate`. Paperclip re-resolves the provider state and signs only the canonical server snapshot. If GitHub is unavailable, incomplete, transient, or changed, creation/execution fails closed. Paperclip records and enforces the decision; it never substitutes for GitHub branch protection, reviews, checks, merge authorization, or the GitHub merge itself.
+This authority-only API does not capture provider evidence. Do not use a decision as authority to merge or deploy without a configured provider resolver and complete external evidence. A Paperclip decision never substitutes for repository branch protection, reviews, checks, merge authorization, or the provider action itself.
 
 Bundle related cross-issue decisions with `POST /api/companies/{companyId}/decision-bundles`:
 

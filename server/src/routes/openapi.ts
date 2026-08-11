@@ -52,9 +52,12 @@ import {
   addDecisionQueueItemSchema,
   createDecisionQueueSchema,
   createDecisionArchiveProposalSchema,
+  decisionAuthorityGrantSchema,
   decisionAttentionSourceKindSchema,
   decisionInputsSchema,
   decisionOptionsSchema,
+  decisionTechnicalEvidenceSchema,
+  externalEnforcementEvidenceSchema,
   removeDecisionQueueItemSchema,
   updateDecisionQueueSchema,
   updateDecisionTriageSchema,
@@ -3694,6 +3697,9 @@ const createDecisionBodySchema = z.object({
   title: z.string().trim().min(1).max(500),
   body: z.string().max(100_000),
   ruleKey: z.string().trim().max(240).nullable().optional(),
+  authority: decisionAuthorityGrantSchema,
+  technicalEvidence: decisionTechnicalEvidenceSchema.nullable().optional(),
+  externalEnforcement: externalEnforcementEvidenceSchema.nullable().optional(),
   options: decisionOptionsSchema,
   inputs: decisionInputsSchema.nullable().optional(),
   expiresAt: z.string().datetime().optional(),
@@ -3708,7 +3714,7 @@ registerCurrentRoute({
   tags: ["decisions"],
   summary: "Propose a decision",
   body: createDecisionBodySchema,
-  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict, 422: r.unprocessable },
 });
 
 registerCurrentRoute({
@@ -3721,7 +3727,7 @@ registerCurrentRoute({
     summary: z.string().max(100_000),
     decisions: z.array(createDecisionBodySchema).min(1).max(50),
   }).strict(),
-  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict, 422: r.unprocessable },
 });
 
 registerCurrentRoute({

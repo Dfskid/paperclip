@@ -2232,7 +2232,14 @@ registry.registerPath({
     params: z.object({ id: z.string() }),
     body: jsonBody(createIssueWorkProductSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: {
+    201: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    422: r.unprocessable,
+  },
 });
 
 registry.registerPath({

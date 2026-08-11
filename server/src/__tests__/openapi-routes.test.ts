@@ -215,6 +215,24 @@ describe("openapi routes", () => {
       decideBy: { nullable: true },
       snoozedUntil: { type: "string", format: "date-time", nullable: true },
     });
+    const createWorkProduct = res.body.paths["/api/issues/{id}/work-products"].post;
+    expect(createWorkProduct.responses["201"]).toBeDefined();
+    expect(createWorkProduct.responses["200"]).toBeUndefined();
+    expect(createWorkProduct.responses["403"]).toBeDefined();
+    expect(createWorkProduct.responses["404"]).toBeDefined();
+    expect(createWorkProduct.responses["422"]).toBeDefined();
+    expect(createWorkProduct.requestBody.content["application/json"].schema.properties.deliveryResidueLink)
+      .toMatchObject({
+        type: "object",
+        properties: {
+          sourceIssueId: { type: "string", format: "uuid" },
+          originKind: {
+            type: "string",
+            enum: ["delivery_courier", "delivery_shepherd", "delivery_poller", "delivery_source_review"],
+          },
+        },
+        required: ["sourceIssueId", "originKind"],
+      });
     expect(JSON.stringify(res.body.paths["/api/tool-gateway/tools"].get)).not.toContain("sessionToken");
     expect(JSON.stringify(res.body.paths["/api/tool-gateway/tools/call"].post)).not.toContain("sessionToken");
   });

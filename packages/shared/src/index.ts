@@ -1746,6 +1746,8 @@ export {
   linkIssueApprovalSchema,
   createIssueAttachmentMetadataSchema,
   createIssueWorkProductSchema,
+  DELIVERY_RESIDUE_ORIGIN_KINDS,
+  deliveryResidueLinkSchema,
   issueWorkProductMetadataSchema,
   updateIssueWorkProductSchema,
   attachmentArtifactWorkProductMetadataSchema,

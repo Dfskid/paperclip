@@ -55,6 +55,7 @@ import {
   issueThreadInteractionService,
   issueService,
   instanceSettingsService,
+  mergedDeliveryResidueService,
   reconcileBuiltInAgentsOnStartup,
   reconcileCodexLocalManagedHomesOnStartup,
   reconcilePersistedRuntimeServicesOnStartup,
@@ -975,14 +976,20 @@ export async function startServer(): Promise<StartedServer> {
     const mergedPullRequestConfirmations = issueThreadInteractionService(db as any, {
       wakeup: heartbeat.wakeup,
     });
+    const mergedDeliveryResidue = mergedDeliveryResidueService(db as any);
     const terminalWorkspaces = executionWorkspaceService(db as any);
     const scheduleMergedPullRequestConfirmationSweep = () => {
       if (heartbeatSchedulerStopped) return;
-      trackHeartbeatSchedulerWork(mergedPullRequestConfirmations
-        .sweepMergedPullRequestConfirmations()
-        .then((result) => {
-          if (result.accepted > 0) {
-            logger.info(result, "accepted merge confirmations for merged pull requests");
+      trackHeartbeatSchedulerWork(Promise.all([
+        mergedPullRequestConfirmations.sweepMergedPullRequestConfirmations(),
+        mergedDeliveryResidue.sweep(),
+      ])
+        .then(([confirmationResult, residueResult]) => {
+          if (confirmationResult.accepted > 0) {
+            logger.info(confirmationResult, "accepted merge confirmations for merged pull requests");
+          }
+          if (residueResult.retiredIssues > 0) {
+            logger.info(residueResult, "retired residue for immutably merged pull requests");
           }
         })
         .catch((err) => {

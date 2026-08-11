@@ -134,4 +134,26 @@ describe("create issue work product with resource ref", () => {
 
     expect(result.metadata?.resourceRef).toBeUndefined();
   });
+
+  it("accepts only the verified delivery-link contract and strips direct origin spoofing", () => {
+    const sourceIssueId = "123e4567-e89b-12d3-a456-426614174000";
+    const result = createIssueWorkProductSchema.parse({
+      type: "pull_request",
+      provider: "github",
+      title: "Feature PR",
+      originKind: "delivery_courier",
+      originId: sourceIssueId,
+      deliveryResidueLink: { sourceIssueId, originKind: "delivery_courier" },
+    });
+
+    expect(result.deliveryResidueLink).toEqual({ sourceIssueId, originKind: "delivery_courier" });
+    expect(result).not.toHaveProperty("originKind");
+    expect(result).not.toHaveProperty("originId");
+    expect(createIssueWorkProductSchema.safeParse({
+      type: "artifact",
+      provider: "paperclip",
+      title: "Not a PR",
+      deliveryResidueLink: { sourceIssueId, originKind: "delivery_courier" },
+    }).success).toBe(false);
+  });
 });

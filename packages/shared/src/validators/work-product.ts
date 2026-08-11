@@ -77,7 +77,19 @@ export const issueWorkProductMetadataSchema = z
 
 export type IssueWorkProductMetadata = z.infer<typeof issueWorkProductMetadataSchema>;
 
-export const createIssueWorkProductSchema = z.object({
+export const DELIVERY_RESIDUE_ORIGIN_KINDS = [
+  "delivery_courier",
+  "delivery_shepherd",
+  "delivery_poller",
+  "delivery_source_review",
+] as const;
+
+export const deliveryResidueLinkSchema = z.object({
+  sourceIssueId: z.string().uuid(),
+  originKind: z.enum(DELIVERY_RESIDUE_ORIGIN_KINDS),
+}).strict();
+
+const issueWorkProductInputSchema = z.object({
   projectId: z.string().uuid().optional().nullable(),
   executionWorkspaceId: z.string().uuid().optional().nullable(),
   runtimeServiceId: z.string().uuid().optional().nullable(),
@@ -95,8 +107,20 @@ export const createIssueWorkProductSchema = z.object({
   createdByRunId: z.string().uuid().optional().nullable(),
 });
 
+export const createIssueWorkProductSchema = issueWorkProductInputSchema.extend({
+  deliveryResidueLink: deliveryResidueLinkSchema.optional(),
+}).superRefine((value, ctx) => {
+  if (value.deliveryResidueLink && value.type !== "pull_request") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Delivery residue linkage requires a pull-request work product",
+      path: ["deliveryResidueLink"],
+    });
+  }
+});
+
 export type CreateIssueWorkProduct = z.infer<typeof createIssueWorkProductSchema>;
 
-export const updateIssueWorkProductSchema = createIssueWorkProductSchema.partial();
+export const updateIssueWorkProductSchema = issueWorkProductInputSchema.partial();
 
 export type UpdateIssueWorkProduct = z.infer<typeof updateIssueWorkProductSchema>;

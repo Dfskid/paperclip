@@ -125,6 +125,7 @@ import {
   ISSUE_LIST_MAX_LIMIT,
   issueReferenceService,
   issueService,
+  mergedDeliveryResidueService,
   type ActivityPublication,
   type IssueFilters,
   clampIssueListLimit,
@@ -2739,6 +2740,7 @@ export function issueRoutes(
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
   const workProductsSvc = workProductService(db);
+  const mergedDeliveryResidueSvc = mergedDeliveryResidueService(db);
   const documentsSvc = documentService(db);
   const companySkillsSvc = companySkillService(db);
   const documentAnnotationsSvc = documentAnnotationService(db);
@@ -7149,8 +7151,30 @@ export function issueRoutes(
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
     const actor = getActorInfo(req);
+    const { deliveryResidueLink, ...workProductBody } = req.body;
+    if (deliveryResidueLink) {
+      const sourceIssue = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(deliveryResidueLink.sourceIssueId),
+        "Issue not found",
+      );
+      if (!sourceIssue) return;
+      if (sourceIssue.companyId !== issue.companyId) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      const sourceRead = await decideIssueAccess(req, sourceIssue, "issue:read");
+      if (!sourceRead.allowed) {
+        // Keep inaccessible sources indistinguishable from nonexistent ones.
+        // Linker validation errors describe PR provenance and must only be
+        // reachable after source visibility is established.
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+    }
     const createInput = {
-      ...req.body,
+      ...workProductBody,
       projectId: req.body.projectId ?? issue.projectId ?? null,
       sourceTrust: await sourceTrustForActorWrite(issue, actor),
     };
@@ -7163,7 +7187,21 @@ export function issueRoutes(
         metadata: req.body.metadata ?? null,
       });
     }
-    const product = await workProductsSvc.createForIssue(issue.id, issue.companyId, createInput);
+    let product;
+    try {
+      product = deliveryResidueLink
+        ? (await mergedDeliveryResidueSvc.createLinkedWorkProduct({
+            companyId: issue.companyId,
+            residueIssueId: issue.id,
+            sourceIssueId: deliveryResidueLink.sourceIssueId,
+            originKind: deliveryResidueLink.originKind,
+            workProduct: createInput,
+          })).product
+        : await workProductsSvc.createForIssue(issue.id, issue.companyId, createInput);
+    } catch (error) {
+      if (!deliveryResidueLink) throw error;
+      throw unprocessable(error instanceof Error ? error.message : "Delivery residue could not be linked");
+    }
     if (!product) {
       res.status(422).json({ error: "Invalid work product payload" });
       return;

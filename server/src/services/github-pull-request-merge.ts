@@ -1,5 +1,8 @@
 import type { Db } from "@paperclipai/db";
-import { createGitHubExternalObjectProvider } from "./github-external-object-provider.js";
+import {
+  createGitHubExternalObjectProvider,
+  type GitHubExternalObjectProviderOptions,
+} from "./github-external-object-provider.js";
 
 export type GitHubPullRequestReference = {
   host: "github.com";
@@ -12,8 +15,17 @@ export type PullRequestMergeState = "merged" | "open" | "unknown";
 
 export type PullRequestMergeDetails = {
   state: PullRequestMergeState;
+  repositoryId: string | null;
+  owner: string;
+  repo: string;
+  number: number;
   headRef: string | null;
   headSha: string | null;
+  baseSha: string | null;
+  mergeCommitSha: string | null;
+  mergedAt: string | null;
+  providerSnapshotId: string | null;
+  observedAt: string | null;
 };
 
 export type PullRequestMergeStateResolver = (
@@ -80,12 +92,40 @@ function readRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-export function createPullRequestMergeDetailsResolver(db: Db): PullRequestMergeDetailsResolver {
-  const resolver = createGitHubExternalObjectProvider(db).resolvers
+function isFullGitSha(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{40}$/i.test(value);
+}
+
+function isTimestamp(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function unknownDetails(reference: GitHubPullRequestReference): PullRequestMergeDetails {
+  return {
+    state: "unknown",
+    repositoryId: null,
+    owner: reference.owner,
+    repo: reference.repo,
+    number: reference.number,
+    headRef: null,
+    headSha: null,
+    baseSha: null,
+    mergeCommitSha: null,
+    mergedAt: null,
+    providerSnapshotId: null,
+    observedAt: null,
+  };
+}
+
+export function createPullRequestMergeDetailsResolver(
+  db: Db,
+  providerOptions: GitHubExternalObjectProviderOptions = {},
+): PullRequestMergeDetailsResolver {
+  const resolver = createGitHubExternalObjectProvider(db, providerOptions).resolvers
     .find((candidate) => candidate.objectType === "pull_request") ?? null;
 
   return async (companyId, reference) => {
-    if (!resolver) return { state: "unknown", headRef: null, headSha: null };
+    if (!resolver) return unknownDetails(reference);
     const result = await resolver.resolve({
       companyId,
       object: {
@@ -93,14 +133,51 @@ export function createPullRequestMergeDetailsResolver(db: Db): PullRequestMergeD
         sanitizedCanonicalUrl: `https://github.com/${reference.owner}/${reference.repo}/pull/${reference.number}`,
       } as never,
     });
-    if (!result.ok) return { state: "unknown", headRef: null, headSha: null };
+    if (!result.ok) return unknownDetails(reference);
     const data = readRecord(result.snapshot.data);
+    const headRef = typeof data?.headRef === "string" ? data.headRef : null;
+    const headSha = isFullGitSha(data?.headSha) ? data.headSha : null;
+    if (result.snapshot.statusKey === "open" || result.snapshot.statusKey === "draft") {
+      return {
+        ...unknownDetails(reference),
+        state: "open",
+        headRef,
+        headSha,
+      };
+    }
+    const repositoryId = typeof data?.repositoryId === "string" && data.repositoryId.length > 0
+      ? data.repositoryId
+      : null;
+    const baseSha = isFullGitSha(data?.baseSha) ? data.baseSha : null;
+    const mergeCommitSha = isFullGitSha(data?.mergeCommitSha) ? data.mergeCommitSha : null;
+    const mergedAt = isTimestamp(data?.mergedAt) ? data.mergedAt : null;
+    const providerSnapshotId = typeof data?.providerSnapshotId === "string" && data.providerSnapshotId.length > 0
+      ? data.providerSnapshotId
+      : null;
+    const observedAt = isTimestamp(data?.observedAt) ? data.observedAt : null;
+    const immutableMergeComplete = (result.snapshot.statusKey === "merged" || data?.merged === true)
+      && repositoryId !== null
+      && headSha !== null
+      && baseSha !== null
+      && mergeCommitSha !== null
+      && mergedAt !== null
+      && providerSnapshotId !== null
+      && observedAt !== null
+      && Date.parse(mergedAt!) <= Date.parse(observedAt!);
+    if (!immutableMergeComplete) return unknownDetails(reference);
     return {
-      state: result.snapshot.statusKey === "merged" || data?.merged === true
-        ? "merged"
-        : "open",
-      headRef: typeof data?.headRef === "string" ? data.headRef : null,
-      headSha: typeof data?.headSha === "string" ? data.headSha : null,
+      state: "merged",
+      repositoryId,
+      owner: reference.owner,
+      repo: reference.repo,
+      number: reference.number,
+      headRef,
+      headSha,
+      baseSha,
+      mergeCommitSha,
+      mergedAt,
+      providerSnapshotId,
+      observedAt,
     };
   };
 }

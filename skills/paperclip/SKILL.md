@@ -102,6 +102,26 @@ When work produces a user-inspectable file, upload true deliverables to the curr
 
 When work produces or updates an operator-facing engineering output, create or update the matching work product: `pull_request` for opened PRs, `preview_url` for published previews, `runtime_service` for managed preview/dev services, `commit` for notable pushed commits, and `branch` when the branch itself is the handoff. Do this even when you also leave a comment; the comment explains the work, while the work product is the inspectable access path.
 
+When a delivery courier, shepherd, poller, or source-review issue registers the same structured pull request as its source issue, bind that provenance in the create call (clients cannot set raw origin fields):
+
+```json
+POST /api/issues/{deliveryIssueId}/work-products
+{
+  "type": "pull_request",
+  "provider": "github",
+  "externalId": "321",
+  "title": "paperclipai/paperclip#321",
+  "url": "https://github.com/paperclipai/paperclip/pull/321",
+  "status": "ready_for_review",
+  "deliveryResidueLink": {
+    "sourceIssueId": "{sourceIssueId}",
+    "originKind": "delivery_courier"
+  }
+}
+```
+
+The source issue must already contain the exact same structured PR work product. Paperclip validates and stamps the origin, creates the product, and records the linkage audit atomically; a mismatched link returns `422` and creates nothing.
+
 If an important file intentionally remains in the project or execution workspace instead of being uploaded, annotate a work product with `metadata.resourceRef.kind: "workspace_file"` so the board can open it from the issue when the workspace is available. Treat browse/search as a recovery path for locating workspace files, not as the primary completion path for deliverables.
 
 For technical upload instructions, read `references/artifacts.md`.

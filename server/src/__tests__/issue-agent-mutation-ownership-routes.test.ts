@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
+const sourceIssueId = "12121212-1212-4121-8121-121212121212";
 const companyId = "22222222-2222-4222-8222-222222222222";
 const ownerAgentId = "33333333-3333-4333-8333-333333333333";
 const peerAgentId = "44444444-4444-4444-8444-444444444444";
@@ -59,6 +60,9 @@ const mockWorkProductService = vi.hoisted(() => ({
   getById: vi.fn(),
   remove: vi.fn(),
   update: vi.fn(),
+}));
+const mockMergedDeliveryResidueService = vi.hoisted(() => ({
+  createLinkedWorkProduct: vi.fn(),
 }));
 
 const mockStorageService = vi.hoisted(() => ({
@@ -232,6 +236,7 @@ function registerRouteMocks() {
       syncIssue: async () => undefined,
     }),
     issueService: () => mockIssueService,
+    mergedDeliveryResidueService: () => mockMergedDeliveryResidueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     taskWatchdogService: () => mockTaskWatchdogService,
     logActivity: mockLogActivity,
@@ -529,6 +534,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockObserveCrossIssueInfluence.mockResolvedValue(null);
     mockDocumentService.upsertIssueDocument.mockReset();
     mockWorkProductService.createForIssue.mockReset();
+    mockMergedDeliveryResidueService.createLinkedWorkProduct.mockReset();
     mockExternalObjectService.getIssueSummaries.mockClear();
     mockExternalObjectService.getIssueSummary.mockClear();
     mockExternalObjectService.getProjectSummary.mockClear();
@@ -1049,6 +1055,44 @@ describe("agent issue mutation checkout ownership", () => {
       companyId,
       expect.objectContaining({ createdByRunId: ownerRunId }),
     );
+  });
+
+  it("does not expose or link an unreadable delivery residue source issue", async () => {
+    mockIssueService.getById.mockImplementation(async (id: string) => id === sourceIssueId
+      ? makeIssue({ id: sourceIssueId, assigneeAgentId: peerAgentId })
+      : makeIssue());
+    mockAccessService.decide.mockImplementation(async (input: {
+      action: string;
+      resource?: { issueId?: string };
+    }) => ({
+      allowed: !(input.action === "issue:read" && input.resource?.issueId === sourceIssueId),
+      action: input.action,
+      reason: input.action === "issue:read" && input.resource?.issueId === sourceIssueId
+        ? "deny_missing_grant"
+        : "allow_explicit_grant",
+      explanation: input.action === "issue:read" && input.resource?.issueId === sourceIssueId
+        ? "Missing permission."
+        : "Allowed by test default.",
+    }));
+
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/work-products`)
+      .send({
+        type: "pull_request",
+        provider: "github",
+        title: "Pull request",
+        url: "https://github.com/paperclipai/paperclip/pull/321",
+        deliveryResidueLink: {
+          sourceIssueId,
+          originKind: "delivery_courier",
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(res.body).toEqual({ error: "Issue not found" });
+    expect(mockMergedDeliveryResidueService.createLinkedWorkProduct).not.toHaveBeenCalled();
+    expect(mockWorkProductService.createForIssue).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
   it("rejects agent-created work products with a forged run id", async () => {

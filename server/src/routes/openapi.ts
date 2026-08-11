@@ -3717,6 +3717,34 @@ registerCurrentRoute({
   responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict, 422: r.unprocessable },
 });
 
+const decisionEvidencePreviewBodySchema = z.object({
+  repository: z.object({
+    owner: z.string().trim().min(1).max(240),
+    name: z.string().trim().min(1).max(240),
+  }).strict(),
+  pullRequestNumber: z.number().int().positive(),
+  actor: z.string().trim().min(1).max(240),
+  expiresAt: z.string().datetime({ offset: true }),
+}).strict();
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/decision-evidence/preview",
+  tags: ["decisions"],
+  summary: "Capture provider-derived GitHub decision evidence",
+  body: decisionEvidencePreviewBodySchema,
+  responses: {
+    200: r.ok(z.object({
+      technicalEvidence: decisionTechnicalEvidenceSchema,
+      externalEnforcement: externalEnforcementEvidenceSchema,
+    }).strict()),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    422: r.unprocessable,
+  },
+});
+
 registerCurrentRoute({
   method: "post",
   path: "/api/companies/{companyId}/decision-bundles",

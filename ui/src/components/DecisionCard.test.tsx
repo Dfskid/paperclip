@@ -55,6 +55,19 @@ function mkDecision(overrides: Partial<Decision> = {}): Decision {
     ruleKey: "stale-epic",
     title: "Stale epic PAP-456",
     body: "No activity for three weeks.",
+    authority: {
+      schemaVersion: 1,
+      authorityClass: "design_approval",
+      issuer: { userId: "board-user", source: { kind: "issue", id: "issue-origin" }, issuedAt: "2026-07-22T08:00:00Z" },
+      actor: { kind: "user", id: "board-user" },
+      targetIssueIds: ["issue-target"],
+      capabilities: [],
+      expiresAt: "2026-07-29T08:00:00Z",
+      requiredExternalGates: [],
+    },
+    technicalEvidence: null,
+    externalEnforcement: null,
+    latestEnforcementResult: null,
     options: [
       { id: "comment", label: "Comment and snooze", effects: [{ type: "comment_on_issue", targetIssueId: "issue-target", staleness: "lenient", bodyMarkdown: "nudge" }] },
     ],
@@ -135,6 +148,55 @@ describe("DecisionCard", () => {
     expect(el.textContent).toContain("PAP-123");
     expect(el.textContent).toContain("Comment on PAP-456");
     expect([...el.querySelectorAll("button")].some((b) => b.textContent?.includes("Dismiss"))).toBe(true);
+  });
+
+  it("separates Paperclip execution authority from GitHub enforcement", () => {
+    const el = render({
+      decision: mkDecision({
+        authority: {
+          schemaVersion: 1,
+          authorityClass: "execution_authority",
+          issuer: { userId: "board-user", source: { kind: "issue", id: "issue-origin" }, issuedAt: "2026-07-22T08:00:00Z" },
+          actor: { kind: "agent", id: "agent-gardener" },
+          targetIssueIds: ["issue-target"],
+          capabilities: ["delivery", "merge"],
+          expiresAt: "2026-07-29T08:00:00Z",
+          requiredExternalGates: ["codeowners_review", "required_checks", "exact_head", "merge_gate"],
+        },
+        externalEnforcement: {
+          schemaVersion: 1,
+          provider: "github",
+          repositoryId: "R_repo",
+          pullRequestNumber: 42,
+          actor: "merge-actor",
+          headSha: "a".repeat(40),
+          evaluatedAt: "2026-07-22T08:30:00Z",
+          allowed: true,
+          gates: [
+            { type: "codeowners_review", status: "passed", evidenceIds: ["review-1"] },
+            { type: "required_checks", status: "passed", evidenceIds: ["run-1"] },
+            { type: "exact_head", status: "passed", evidenceIds: ["head-1"] },
+            { type: "merge_gate", status: "passed", evidenceIds: ["gate-1"] },
+          ],
+        },
+      }),
+    });
+
+    expect(el.textContent).toContain("Execution authority");
+    expect(el.textContent).toContain("GitHub remains the enforcement authority");
+    expect(el.textContent).toContain("does not replace CODEOWNERS review");
+    expect(el.textContent).toContain("revalidated before effects run");
+  });
+
+  it("renders legacy unsigned decisions as read-only with a safe close path", () => {
+    const onDismiss = vi.fn();
+    const el = render({ decision: mkDecision({ authority: null }), onDismiss });
+
+    expect(el.textContent).toContain("Legacy decision · read-only");
+    expect(el.textContent).toContain("re-propose with signed authority");
+    expect(el.textContent).not.toContain("Comment and snooze");
+    clickButtonWithText(el, "Close legacy decision");
+    expect(onDismiss).toHaveBeenCalledWith("legacy_read_only");
   });
 
   it("links the target issue the decision applies to, not just the origin", () => {
@@ -299,6 +361,41 @@ describe("DecisionCard", () => {
     });
     expect(el.textContent).toContain("Failed");
     expect(el.textContent).toContain("target changed since proposal");
+  });
+
+  it("renders an evidence or external-gate denial as blocked rather than failed", () => {
+    const el = render({
+      decision: mkDecision({
+        status: "decided",
+        executionStatus: "blocked",
+        chosenOptionId: "comment",
+        latestEnforcementResult: {
+          schemaVersion: 1,
+          provider: "github",
+          repositoryId: "R_repo",
+          pullRequestNumber: 42,
+          actor: "merge-actor",
+          headSha: "a".repeat(40),
+          evaluatedAt: "2026-07-22T08:30:00Z",
+          allowed: false,
+          gates: [{ type: "required_checks", status: "failed", evidenceIds: ["run-1"] }],
+        },
+      }),
+      executions: [
+        exec({
+          effectIndex: 0,
+          effectType: "comment_on_issue",
+          status: "failed",
+          error: "external_enforcement_denied",
+        }),
+      ],
+    });
+
+    expect(el.textContent).toContain("Blocked");
+    expect(el.textContent).toContain("Blocked on PAP-456");
+    expect(el.textContent).not.toContain("Failed");
+    expect(el.textContent).toContain("external gate or evidence check denied execution");
+    expect(el.textContent).toContain("re-propose");
   });
 
   it("renders expired and dismissed terminal states", () => {

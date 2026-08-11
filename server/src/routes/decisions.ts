@@ -44,6 +44,19 @@ const statsQuerySchema = z.object({
   originAgentId: z.string().uuid().optional(),
   since: z.coerce.date().optional(),
 }).strict();
+const evidencePreviewSchema = z.object({
+  repository: z.object({
+    owner: z.string().trim().min(1).max(240),
+    name: z.string().trim().min(1).max(240),
+  }).strict(),
+  pullRequestNumber: z.number().int().positive(),
+  actor: z.string().trim().min(1).max(240),
+  expiresAt: z.string().datetime({ offset: true }),
+}).strict().superRefine((input, ctx) => {
+  if (Date.parse(input.expiresAt) <= Date.now()) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Evidence expiry must be in the future", path: ["expiresAt"] });
+  }
+});
 
 function agentContext(req: Parameters<typeof getActorInfo>[0]) {
   if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.runId) return null;
@@ -152,6 +165,15 @@ export function decisionRoutes(db: Db, options: DecisionServiceOptions) {
     const companyId = req.params.companyId as string; assertCompanyAccess(req, companyId);
     const agent = agentContext(req); if (!agent) { res.status(403).json({ error: "Agent run context required" }); return; }
     res.status(201).json(await svc.create({ companyId, actor: req.actor, ...agent, ...req.body }));
+  });
+  router.post("/companies/:companyId/decision-evidence/preview", validate(evidencePreviewSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertBoardOrAgent(req);
+    assertCompanyAccess(req, companyId);
+    if (!options.captureDecisionEvidence) {
+      throw unprocessable("GitHub decision evidence capture is unavailable");
+    }
+    res.json(await options.captureDecisionEvidence(companyId, req.body));
   });
   router.post("/companies/:companyId/decision-bundles", validate(bundleSchema), async (req, res) => {
     const companyId = req.params.companyId as string; assertCompanyAccess(req, companyId);

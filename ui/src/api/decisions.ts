@@ -1,4 +1,10 @@
-import type { DecisionInput, DecisionOption } from "@paperclipai/shared";
+import type {
+  DecisionAuthorityGrantV1,
+  DecisionInput,
+  DecisionOption,
+  DecisionTechnicalEvidenceV1,
+  ExternalEnforcementEvidenceV1,
+} from "@paperclipai/shared";
 import { api } from "./client";
 
 /**
@@ -11,7 +17,7 @@ import { api } from "./client";
  */
 
 export type DecisionStatus = "open" | "decided" | "expired" | "cancelled";
-export type DecisionExecutionStatus = "running" | "succeeded" | "partial" | "failed";
+export type DecisionExecutionStatus = "running" | "succeeded" | "partial" | "failed" | "blocked";
 export type DecisionEffectExecutionStatus = "claimed" | "executed" | "failed" | "skipped";
 
 export interface DecisionTargetSnapshot {
@@ -35,6 +41,10 @@ export interface Decision {
   ruleKey: string | null;
   title: string;
   body: string;
+  authority: DecisionAuthorityGrantV1 | null;
+  technicalEvidence: DecisionTechnicalEvidenceV1 | null;
+  externalEnforcement: ExternalEnforcementEvidenceV1 | null;
+  latestEnforcementResult: ExternalEnforcementEvidenceV1 | null;
   options: DecisionOption[];
   inputs: DecisionInput[] | null;
   status: DecisionStatus;

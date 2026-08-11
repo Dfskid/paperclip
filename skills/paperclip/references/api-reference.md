@@ -414,7 +414,13 @@ Interpretation:
 - `returnAssignee` is who gets the task back when changes are requested
 - `lastDecisionOutcome` shows the latest gate decision
 
-There is **no separate execution-decision endpoint**. Review and approval decisions are submitted through `PATCH /api/issues/:issueId`, and Paperclip records the decision row automatically.
+There is **no separate endpoint for execution-policy stage decisions**. Review and approval stage decisions are submitted through `PATCH /api/issues/:issueId`, and Paperclip records that stage decision automatically. This is distinct from standalone governed decisions created through `POST /api/companies/:companyId/decisions` (or `/decision-bundles`); GitHub-affecting grants first use `POST /api/companies/:companyId/decision-evidence/preview`.
+
+### Standalone Governed Decisions
+
+Every standalone create requires an `authority`. `design_approval` has empty capabilities and gates and can authorize only design-safe outcomes. Any mutation requires `execution_authority`, explicit target issue UUIDs, and every capability required by its effects. The issuer must be the authenticated origin run's responsible user, the actor must be the origin agent, and an issue source must be the origin issue UUID. A decision-sourced child may narrow parent targets/capabilities and expiry, but must retain all parent-required gates.
+
+For `merge` or `deploy`, call `/decision-evidence/preview`, copy its canonical `technicalEvidence` and `externalEnforcement` into the create request, and require all six gates: `github_actor`, `codeowners_review`, `branch_protection`, `required_checks`, `exact_head`, and `merge_gate`. Provider unavailability, incomplete data, or drift fails closed. Paperclip records and revalidates this governance evidence; it never replaces GitHub reviews, branch protection, checks, authorization, or merge execution. Legacy rows with no authority are read-only; an authenticated board member may safely dismiss them without running effects, then re-propose with explicit authority if action is still needed.
 
 ### Cross-Agent Review Gates
 

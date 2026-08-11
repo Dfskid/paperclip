@@ -127,9 +127,17 @@ const FAILURE_CAUSE: Record<string, string> = {
   effect_execution_failed: "the effect errored while running",
 };
 
+const EVIDENCE_BLOCKED_ERRORS = new Set([
+  "evidence_expired",
+  "evidence_unavailable",
+  "evidence_unparsable",
+  "evidence_drifted",
+  "external_enforcement_denied",
+]);
+
 interface ResultRow {
   key: string;
-  status: DecisionEffectExecution["status"];
+  status: DecisionEffectExecution["status"] | "blocked";
   summary: string;
   link: DecisionIssueRef | null;
 }
@@ -145,6 +153,14 @@ function executionRow(
     return { key: execution.id, status: "skipped", summary: `Skipped ${target} — target changed since proposal`, link: targetRef };
   }
   if (execution.status === "failed") {
+    if (execution.error && EVIDENCE_BLOCKED_ERRORS.has(execution.error)) {
+      return {
+        key: execution.id,
+        status: "blocked",
+        summary: `Blocked on ${target} — external gate or evidence check denied execution`,
+        link: targetRef,
+      };
+    }
     const cause = FAILURE_CAUSE[execution.error ?? ""] ?? execution.error ?? "the effect could not run";
     return { key: execution.id, status: "failed", summary: `Failed on ${target} — ${cause}`, link: targetRef };
   }
@@ -184,13 +200,14 @@ function executionRow(
 
 // --- shell / badge palette (matches IssueThreadInteractionCard) --------------
 
-type CardTone = "pending" | "destructive" | "success" | "partial" | "failed" | "neutral";
+type CardTone = "pending" | "destructive" | "success" | "partial" | "blocked" | "failed" | "neutral";
 
 const SHELL: Record<CardTone, string> = {
   pending: "border-sky-500/70",
   destructive: "border-2 border-rose-500/80",
   success: "border-emerald-400/70",
   partial: "border-amber-400/70",
+  blocked: "border-orange-400/70",
   failed: "border-rose-400/70",
   neutral: "border-border/60",
 };
@@ -200,6 +217,7 @@ const BADGE: Record<CardTone, string> = {
   destructive: "border-rose-500/60 bg-rose-500/10 text-rose-800 dark:bg-rose-500/15 dark:text-rose-100",
   success: "border-emerald-500/60 bg-emerald-500/10 text-emerald-900 dark:bg-emerald-500/15 dark:text-emerald-100",
   partial: "border-amber-500/60 bg-amber-500/10 text-amber-900 dark:bg-amber-500/15 dark:text-amber-100",
+  blocked: "border-orange-500/60 bg-orange-500/10 text-orange-900 dark:bg-orange-500/15 dark:text-orange-100",
   failed: "border-rose-500/60 bg-rose-500/10 text-rose-800 dark:bg-rose-500/15 dark:text-rose-100",
   neutral: "border-border/70 bg-muted/50 text-muted-foreground",
 };
@@ -219,6 +237,7 @@ function IssueLink({ ref: link }: { ref: DecisionIssueRef | null }) {
 
 const RESULT_ICON: Record<ResultRow["status"], ReactNode> = {
   executed: <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden />,
+  blocked: <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-orange-600 dark:text-orange-400" aria-hidden />,
   failed: <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" aria-hidden />,
   skipped: <MinusCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden />,
   claimed: <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-muted-foreground" aria-hidden />,
@@ -247,6 +266,9 @@ export function DecisionCard({
   const dismissed =
     decision.chosenOptionId === "dismissed" || (decision.metadata as { dismissed?: boolean } | null)?.dismissed === true;
   const snapshots = (decision.targetSnapshots ?? {}) as Record<string, DecisionTargetSnapshot>;
+  const authority = decision.authority;
+  const legacyReadOnly = open && authority === null;
+  const enforcement = decision.latestEnforcementResult ?? decision.externalEnforcement;
 
   const staleTargetIds = useMemo(
     () => (open ? Object.entries(targetChanged ?? {}).filter(([, changed]) => changed).map(([id]) => id) : []),
@@ -268,7 +290,9 @@ export function DecisionCard({
           ? "success"
           : decision.executionStatus === "partial"
             ? "partial"
-            : "failed";
+            : decision.executionStatus === "blocked"
+              ? "blocked"
+              : "failed";
 
   const badgeLabel = open
     ? "Pending"
@@ -282,7 +306,9 @@ export function DecisionCard({
             ? "Decided"
             : decision.executionStatus === "partial"
               ? "Partial"
-              : "Failed";
+              : decision.executionStatus === "blocked"
+                ? "Blocked"
+                : "Failed";
 
   const requiredUnmet = (decision.inputs ?? []).some(
     (field) => field.required && !(inputValues[field.id] ?? "").trim(),
@@ -379,6 +405,48 @@ export function DecisionCard({
       </p>
 
       {/* Body */}
+      {legacyReadOnly && (
+        <div className="mt-3 rounded-lg border border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-900 dark:text-amber-100">
+          <div className="flex items-center gap-2 font-semibold">
+            <ShieldAlert className="h-4 w-4" aria-hidden /> Legacy decision · read-only
+          </div>
+          <p className="mt-1">
+            This decision predates signed authority. Its effects cannot run; close it without effects, then ask the proposer to re-propose with signed authority.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-2"
+            disabled={busy}
+            onClick={() => onDismiss?.("legacy_read_only")}
+          >
+            Close legacy decision — no effects
+          </Button>
+        </div>
+      )}
+      {authority && (
+        <div className="mt-3 rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          <div className="font-semibold text-foreground">
+            {authority.authorityClass === "design_approval" ? "Design approval" : "Execution authority"}
+          </div>
+          <p className="mt-1">
+            {authority.authorityClass === "design_approval"
+              ? "This approval covers design only. It does not authorize implementation, delivery, deployment, or merge."
+              : "Execution is limited to the signed targets, capabilities, actor, and expiry."}
+          </p>
+          {authority.requiredExternalGates.length > 0 && (
+            <>
+              <p className="mt-1">
+                GitHub remains the enforcement authority. Paperclip records intent and authority, but it does not replace CODEOWNERS review, branch protection, required checks, exact-head checks, or merge gates.
+              </p>
+              <p className="mt-1 font-medium text-foreground">
+                {enforcement?.allowed ? "Recorded external gates passed" : "External gates are not satisfied"}; they are revalidated before effects run.
+              </p>
+            </>
+          )}
+        </div>
+      )}
+
       {decision.body?.trim() && (
         <div className="mt-3 text-sm leading-6 text-foreground/90">
           <MarkdownBody>{decision.body}</MarkdownBody>
@@ -413,7 +481,7 @@ export function DecisionCard({
       )}
 
       {/* Inputs (open only) */}
-      {open && (decision.inputs ?? []).length > 0 && (
+      {open && !legacyReadOnly && (decision.inputs ?? []).length > 0 && (
         <div className="mt-3 space-y-2">
           {(decision.inputs ?? []).map((field) => (
             <label key={field.id} className="block">
@@ -434,7 +502,7 @@ export function DecisionCard({
       )}
 
       {/* Options (open only) */}
-      {open && (
+      {open && !legacyReadOnly && (
         <div className="mt-3 space-y-2">
           {decision.options.map((option) => {
             const destructive = isDestructiveOption(option);
@@ -598,6 +666,16 @@ export function DecisionCard({
             <p className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
               Dismissed — no effects were run.
             </p>
+          )}
+          {decision.status === "decided" && !dismissed && decision.executionStatus === "blocked" && (
+            <div className="rounded-lg border border-orange-500/60 bg-orange-500/10 px-3 py-2 text-xs text-orange-900 dark:text-orange-100">
+              <div className="flex items-center gap-2 font-medium">
+                <ShieldAlert className="h-4 w-4" aria-hidden /> Execution was blocked
+              </div>
+              <p className="mt-1">
+                An external gate or evidence check denied execution. No denied effect was treated as successful; refresh the evidence and re-propose.
+              </p>
+            </div>
           )}
           {decision.status === "decided" && !dismissed && (executions ?? []).length > 0 && (
             <>

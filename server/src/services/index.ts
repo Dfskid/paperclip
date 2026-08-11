@@ -76,6 +76,7 @@ export { attentionService } from "./attention.js";
 export { captureDecisionSnapshot, decisionTrainingService } from "./decision-training.js";
 export { decisionService } from "./decisions.js";
 export { decisionRetentionService } from "./decision-retention.js";
+export { createGitHubDecisionEvidenceCapture, createGitHubDecisionEvidenceLoader } from "./decision-evidence.js";
 export type {
   WorkTimelineActor,
   WorkTimelineEdge,

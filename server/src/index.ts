@@ -49,6 +49,8 @@ import {
   environmentCustomImageService,
   decisionService,
   decisionRetentionService,
+  createGitHubDecisionEvidenceCapture,
+  createGitHubDecisionEvidenceLoader,
   externalObjectService,
   executionWorkspaceService,
   heartbeatService,
@@ -729,6 +731,8 @@ export async function startServer(): Promise<StartedServer> {
     : null;
   const decisionServiceOptions = {
     wakeOriginAgent: createDecisionWakeOriginAgent(heartbeat?.wakeup ?? null),
+    captureDecisionEvidence: createGitHubDecisionEvidenceCapture(db as any),
+    loadDecisionEvidence: createGitHubDecisionEvidenceLoader(db as any),
   };
   // Managed instances drive bundled plugin auto-install from the managed-config
   // document parsed fail-closed above (`plugins.autoInstall`). Absent env means

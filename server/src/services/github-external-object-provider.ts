@@ -17,6 +17,7 @@ export interface GitHubExternalObjectProviderOptions {
   fetch?: FetchLike;
   tokenProvider?: (companyId: string) => Promise<string | null> | string | null;
   secretNames?: readonly string[];
+  now?: () => Date;
 }
 
 interface GitHubObjectIdentity {
@@ -188,7 +189,12 @@ function notFoundSnapshot(identity: GitHubObjectIdentity, etag: string | null): 
   };
 }
 
-function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string, unknown>, etag: string | null): ExternalObjectResolverSnapshot {
+function pullRequestSnapshot(
+  identity: GitHubObjectIdentity,
+  body: Record<string, unknown>,
+  etag: string | null,
+  observedAt: Date,
+): ExternalObjectResolverSnapshot {
   const title = asString(body.title);
   const state = asString(body.state) ?? "unknown";
   const draft = asBoolean(body.draft) ?? false;
@@ -197,6 +203,19 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
   const headRef = asNestedString(body, "head", "ref");
   const headSha = asNestedString(body, "head", "sha");
   const baseRef = asNestedString(body, "base", "ref");
+  const baseSha = asNestedString(body, "base", "sha");
+  const base = asRecord(body.base);
+  const repository = base ? asRecord(base.repo) : null;
+  const repositoryId = repository
+    ? asString(repository.node_id)
+      ?? (typeof repository.id === "number" && Number.isSafeInteger(repository.id) ? String(repository.id) : null)
+    : null;
+  const mergeCommitSha = asString(body.merge_commit_sha);
+  const mergedAt = asString(body.merged_at);
+  const remoteVersion = asString(body.updated_at);
+  const providerSnapshotId = repositoryId && remoteVersion
+    ? `github:${repositoryId}:pull/${identity.number}:${remoteVersion}:${etag ?? "no-etag"}`
+    : null;
   const reviewDecision = asString(body.review_decision);
 
   let statusKey = state;
@@ -240,7 +259,7 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
     statusCategory,
     statusTone,
     isTerminal,
-    remoteVersion: asString(body.updated_at),
+    remoteVersion,
     etag,
     ttlSeconds: GITHUB_OBJECT_TTL_SECONDS,
     data: {
@@ -248,13 +267,19 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
       owner: identity.owner,
       repo: identity.repo,
       number: identity.number,
+      observedAt: observedAt.toISOString(),
       state,
       merged,
       draft,
+      ...(repositoryId ? { repositoryId } : {}),
+      ...(providerSnapshotId ? { providerSnapshotId } : {}),
       ...(authorLogin ? { authorLogin } : {}),
       ...(headRef ? { headRef } : {}),
       ...(headSha ? { headSha } : {}),
       ...(baseRef ? { baseRef } : {}),
+      ...(baseSha ? { baseSha } : {}),
+      ...(mergeCommitSha ? { mergeCommitSha } : {}),
+      ...(mergedAt ? { mergedAt } : {}),
       ...(reviewDecision ? { reviewDecision } : {}),
     },
   };
@@ -319,15 +344,26 @@ async function defaultTokenProvider(db: Db, companyId: string, secretNames: read
   return null;
 }
 
+/** Shared credential seam for GitHub-backed external evidence resolvers. */
+export async function resolveGitHubApiToken(
+  db: Db,
+  companyId: string,
+  opts: Pick<GitHubExternalObjectProviderOptions, "tokenProvider" | "secretNames"> = {},
+) {
+  const secretNames = opts.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
+  const tokenProvider = Object.prototype.hasOwnProperty.call(opts, "tokenProvider") && opts.tokenProvider !== undefined
+    ? opts.tokenProvider
+    : ((targetCompanyId: string) => defaultTokenProvider(db, targetCompanyId, secretNames));
+  const token = typeof tokenProvider === "function" ? await tokenProvider(companyId) : tokenProvider;
+  return token?.trim() || null;
+}
+
 export function createGitHubExternalObjectProvider(
   db: Db,
   opts: GitHubExternalObjectProviderOptions = {},
 ): { detector: ExternalObjectDetector; resolvers: ExternalObjectResolver[] } {
   const fetchImpl = opts.fetch ?? ghFetch;
-  const secretNames = opts.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
-  const tokenProvider = Object.prototype.hasOwnProperty.call(opts, "tokenProvider") && opts.tokenProvider !== undefined
-    ? opts.tokenProvider
-    : ((companyId: string) => defaultTokenProvider(db, companyId, secretNames));
+  const now = opts.now ?? (() => new Date());
 
   const detector: ExternalObjectDetector = {
     key: "github",
@@ -368,7 +404,7 @@ export function createGitHubExternalObjectProvider(
 
         let token: string | null = null;
         try {
-          token = typeof tokenProvider === "function" ? await tokenProvider(companyId) : tokenProvider;
+          token = await resolveGitHubApiToken(db, companyId, opts);
         } catch {
           return {
             ok: false,
@@ -378,7 +414,6 @@ export function createGitHubExternalObjectProvider(
             retryAfterSeconds: GITHUB_OBJECT_TTL_SECONDS,
           };
         }
-        token = token?.trim() || null;
         const headers: Record<string, string> = {
           accept: "application/vnd.github+json",
           "user-agent": "paperclip-external-object-resolver",
@@ -433,7 +468,7 @@ export function createGitHubExternalObjectProvider(
         return {
           ok: true,
           snapshot: objectType === "pull_request"
-            ? pullRequestSnapshot(identity, body, etag)
+            ? pullRequestSnapshot(identity, body, etag, now())
             : issueSnapshot(identity, body, etag),
         };
       },

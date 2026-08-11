@@ -217,10 +217,21 @@ describe("openapi routes", () => {
     });
     const createDecision = res.body.paths["/api/companies/{companyId}/decisions"].post;
     expect(createDecision.responses["422"]).toBeDefined();
-    expect(createDecision.requestBody.content["application/json"].schema.required).toContain("authority");
-    expect(createDecision.requestBody.content["application/json"].schema.properties.authority).toBeDefined();
-    expect(createDecision.requestBody.content["application/json"].schema.properties.technicalEvidence).toBeDefined();
-    expect(createDecision.requestBody.content["application/json"].schema.properties.externalEnforcement).toBeDefined();
+    expect(createDecision.requestBody.content["application/json"].schema).toMatchObject({
+      properties: {
+        authority: { oneOf: expect.any(Array) },
+        technicalEvidence: { nullable: true },
+        externalEnforcement: { nullable: true },
+      },
+      required: expect.arrayContaining(["authority", "title", "body", "options"]),
+    });
+    const previewEvidence = res.body.paths["/api/companies/{companyId}/decision-evidence/preview"].post;
+    expect(previewEvidence.summary).toBe("Capture provider-derived GitHub decision evidence");
+    expect(previewEvidence.responses["200"].content["application/json"].schema.properties).toMatchObject({
+      technicalEvidence: { type: "object" },
+      externalEnforcement: { type: "object" },
+    });
+    expect(previewEvidence.responses["422"]).toBeDefined();
     expect(res.body.paths["/api/companies/{companyId}/decision-bundles"].post.responses["422"]).toBeDefined();
     expect(JSON.stringify(res.body.paths["/api/tool-gateway/tools"].get)).not.toContain("sessionToken");
     expect(JSON.stringify(res.body.paths["/api/tool-gateway/tools/call"].post)).not.toContain("sessionToken");

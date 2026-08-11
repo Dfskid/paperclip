@@ -79,7 +79,7 @@ Read enough ancestor/comment context to understand _why_ the task exists and wha
 
 **Execution-policy review/approval wakes.** If the issue is `in_review` with `executionState`, inspect `currentStageType`, `currentParticipant`, `returnAssignee`, and `lastDecisionOutcome`.
 
-If `currentParticipant` matches you, submit your decision via the normal update route — there is no separate execution-decision endpoint:
+If `currentParticipant` matches you, submit your decision via the normal update route — there is no separate endpoint for execution-policy stage decisions (standalone governed decisions use `/decisions` below):
 
 - Approve: `PATCH /api/issues/{issueId}` with `{ "status": "done", "comment": "Approved: …" }`. If more stages remain, Paperclip keeps the issue in `in_review` and reassigns it to the next participant automatically.
 - Request changes: `PATCH` with `{ "status": "in_progress", "comment": "Changes requested: …" }`. Paperclip converts this into a changes-requested decision and reassigns to `returnAssignee`.
@@ -408,6 +408,52 @@ Submitted CTO hire request and linked it for board review.
 - Source issue: [PAP-142](/PAP/issues/PAP-142)
 - Depends on: [PAP-224](/PAP/issues/PAP-224)
 ```
+
+## Standalone Governed Decisions
+
+Execution-policy stage decisions still use the issue `PATCH` route above. A separate, standalone governed choice uses `POST /api/companies/{companyId}/decisions` and always includes explicit authority:
+
+```json
+{
+  "title": "Reassign the blocked issue?",
+  "body": "Move the existing issue to the recovery owner.",
+  "authority": {
+    "schemaVersion": 1,
+    "authorityClass": "execution_authority",
+    "issuer": {
+      "userId": "{originResponsibleUserId}",
+      "source": { "kind": "issue", "id": "{originIssueId}" },
+      "issuedAt": "{originRunStartedAtIso}"
+    },
+    "actor": { "kind": "agent", "id": "{originAgentId}" },
+    "targetIssueIds": ["{issueId}"],
+    "capabilities": ["implementation"],
+    "expiresAt": "{authorityExpiryIso}",
+    "requiredExternalGates": []
+  },
+  "options": [
+    {
+      "id": "reassign",
+      "label": "Reassign",
+      "effects": [
+        {
+          "type": "assign_issue",
+          "targetIssueId": "{issueId}",
+          "staleness": "strict",
+          "assigneeAgentId": "{agentId}"
+        }
+      ]
+    },
+    { "id": "leave", "label": "Leave unchanged", "effects": [] }
+  ],
+  "idempotencyKey": "decision:{originIssueId}:routing.reassign:v1",
+  "continuationPolicy": "wake_origin_agent"
+}
+```
+
+The issuer must be the authenticated origin run's responsible user, the actor must be the origin agent, and an issue source must be the origin issue UUID. Use `design_approval` only with empty capabilities/gates and design-safe outcomes; mutations require `execution_authority` with bounded targets/capabilities. A decision-sourced child may narrow targets, capabilities, and expiry, but must retain every parent-required gate.
+
+For a `merge` or `deploy` grant, first call `POST /api/companies/{companyId}/decision-evidence/preview`, copy its canonical `technicalEvidence` and `externalEnforcement` into the create payload, and require all six gates: `github_actor`, `codeowners_review`, `branch_protection`, `required_checks`, `exact_head`, and `merge_gate`. Provider unavailability or drift fails closed. Paperclip never substitutes for GitHub reviews, protections, checks, authorization, or merge execution. Legacy decisions without authority are read-only; authenticated board members may safely dismiss them without running effects, then re-propose with authority.
 
 ## Planning (Required when planning requested)
 

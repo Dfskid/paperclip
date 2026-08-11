@@ -226,6 +226,14 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .then((rows) => rows[0]?.issuePrefix ?? "PAP");
   }
 
+  async function getCompanyResolvedSnoozeMs(companyId: string) {
+    const rows = await db
+      .select({ snoozeMs: companies.productivityReviewResolvedSnoozeMs })
+      .from(companies)
+      .where(eq(companies.id, companyId));
+    return rows[0]?.snoozeMs ?? null;
+  }
+
   async function getAgent(agentId: string) {
     return db
       .select()
@@ -878,6 +886,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     };
 
     const prefixCache = new Map<string, string>();
+    const snoozeCache = new Map<string, number | null>();
     for (const candidate of candidates) {
       if (!candidate.assigneeAgentId) {
         result.skipped += 1;
@@ -887,7 +896,14 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         result.skipped += 1;
         continue;
       }
-      if (await findRecentTerminalProductivityReview(candidate.companyId, candidate.id, thresholds, now)) {
+      if (!snoozeCache.has(candidate.companyId)) {
+        snoozeCache.set(candidate.companyId, await getCompanyResolvedSnoozeMs(candidate.companyId));
+      }
+      const companySnoozeMs = snoozeCache.get(candidate.companyId);
+      const candidateThresholds = companySnoozeMs != null
+        ? buildThresholds({ ...(opts?.thresholds ?? {}), resolvedSnoozeMs: companySnoozeMs })
+        : thresholds;
+      if (await findRecentTerminalProductivityReview(candidate.companyId, candidate.id, candidateThresholds, now)) {
         result.snoozed += 1;
         continue;
       }
@@ -901,7 +917,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         result.skipped += 1;
         continue;
       }
-      const evidence = await collectEvidence(candidate, sourceAgent, thresholds, now);
+      const evidence = await collectEvidence(candidate, sourceAgent, candidateThresholds, now);
       if (!evidence) {
         result.skipped += 1;
         continue;
@@ -912,7 +928,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         prefixCache.set(candidate.companyId, prefix);
       }
       try {
-        const outcome = await createOrUpdateReview(evidence, { prefix, thresholds });
+        const outcome = await createOrUpdateReview(evidence, { prefix, thresholds: candidateThresholds });
         if (outcome.kind === "created") result.created += 1;
         else if (outcome.kind === "updated") result.updated += 1;
         else if (outcome.kind === "creation_capped") result.creationCapped += 1;

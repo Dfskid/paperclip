@@ -1,5 +1,8 @@
 import { z } from "zod";
+import { DELIVERY_RESIDUE_ORIGIN_KINDS } from "../constants.js";
 import { workspaceFileRefSchema } from "./workspace-file-resource.js";
+
+export { DELIVERY_RESIDUE_ORIGIN_KINDS };
 
 function attachmentContentPath(attachmentId: string): string {
   return `/api/attachments/${attachmentId}/content`;
@@ -76,13 +79,6 @@ export const issueWorkProductMetadataSchema = z
   .passthrough();
 
 export type IssueWorkProductMetadata = z.infer<typeof issueWorkProductMetadataSchema>;
-
-export const DELIVERY_RESIDUE_ORIGIN_KINDS = [
-  "delivery_courier",
-  "delivery_shepherd",
-  "delivery_poller",
-  "delivery_source_review",
-] as const;
 
 export const deliveryResidueLinkSchema = z.object({
   sourceIssueId: z.string().uuid(),

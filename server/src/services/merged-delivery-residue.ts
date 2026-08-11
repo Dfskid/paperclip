@@ -4,14 +4,17 @@ import { issueWorkProducts, issues } from "@paperclipai/db";
 import { DELIVERY_RESIDUE_ORIGIN_KINDS, isUuidLike } from "@paperclipai/shared";
 import {
   createPullRequestMergeDetailsResolver,
+  setBoundedPullRequestCacheEntry,
   type GitHubPullRequestReference,
   type PullRequestMergeDetailsResolver,
 } from "./github-pull-request-merge.js";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { issueService } from "./issues.js";
-import { toIssueWorkProduct } from "./work-products.js";
+import { acquireDeliveryResidueMutationLocks, toIssueWorkProduct } from "./work-products.js";
 
 export const MERGED_DELIVERY_RESIDUE_ORIGIN_KINDS = DELIVERY_RESIDUE_ORIGIN_KINDS;
+const NON_MERGED_RETRY_BASE_MS = 60_000;
+const NON_MERGED_RETRY_MAX_MS = 15 * 60_000;
 
 type ResidueOriginKind = (typeof MERGED_DELIVERY_RESIDUE_ORIGIN_KINDS)[number];
 
@@ -87,24 +90,42 @@ function activeResidueCondition() {
 export function mergedDeliveryResidueService(db: Db, options: {
   resolvePullRequestDetails?: PullRequestMergeDetailsResolver;
   now?: () => Date;
+  /** Test/diagnostic observer invoked after locked status/evidence revalidation. */
+  afterEligibilityRevalidation?: (input: {
+    companyId: string;
+    sourceIssueId: string;
+    activeResidueIssueIds: string[];
+    eligibleResidueIssueIds: string[];
+  }) => void | Promise<void>;
 } = {}) {
   const resolvePullRequestDetails = options.resolvePullRequestDetails ?? createPullRequestMergeDetailsResolver(db);
   const now = options.now ?? (() => new Date());
   let scanCursor: { updatedAt: Date; id: string } | null = null;
   let scanHighWater: { updatedAt: Date; id: string } | null = null;
+  let sweepInFlight: Promise<MergedDeliveryResidueSweepResult> | null = null;
+  const sourceRetries = new Map<string, { attempts: number; retryAfterMs: number }>();
 
-  async function workProductsByIssue(dbOrTx: Db, companyId: string, issueIds: string[]) {
+  async function workProductsByIssue(
+    dbOrTx: Db,
+    companyId: string,
+    issueIds: string[],
+    lockRows = false,
+  ) {
     if (issueIds.length === 0) return new Map<string, PullRequestWorkProduct[]>();
-    const rows = await dbOrTx.select({
-      issueId: issueWorkProducts.issueId,
-      provider: issueWorkProducts.provider,
-      externalId: issueWorkProducts.externalId,
-      url: issueWorkProducts.url,
-    }).from(issueWorkProducts).where(and(
-      eq(issueWorkProducts.companyId, companyId),
-      eq(issueWorkProducts.type, "pull_request"),
-      inArray(issueWorkProducts.issueId, issueIds),
-    ));
+    const query = () => dbOrTx.select({
+        id: issueWorkProducts.id,
+        issueId: issueWorkProducts.issueId,
+        provider: issueWorkProducts.provider,
+        externalId: issueWorkProducts.externalId,
+        url: issueWorkProducts.url,
+      }).from(issueWorkProducts).where(and(
+        eq(issueWorkProducts.companyId, companyId),
+        eq(issueWorkProducts.type, "pull_request"),
+        inArray(issueWorkProducts.issueId, issueIds),
+      ));
+    const rows = lockRows
+      ? await query().orderBy(asc(issueWorkProducts.issueId), asc(issueWorkProducts.id)).for("update")
+      : await query();
     const result = new Map<string, PullRequestWorkProduct[]>();
     for (const row of rows) {
       const group = result.get(row.issueId) ?? [];
@@ -127,7 +148,7 @@ export function mergedDeliveryResidueService(db: Db, options: {
       || !details.mergeCommitSha
       || !details.mergedAt
       || !details.providerSnapshotId
-      || !details.observedAt) return 0;
+      || !details.observedAt) return { retired: 0, retry: true };
 
     const publications: ActivityPublication[] = [];
     const retired = await db.transaction(async (tx) => {
@@ -150,16 +171,56 @@ export function mergedDeliveryResidueService(db: Db, options: {
       )).orderBy(asc(issues.id));
       if (current.length === 0) return [] as Array<{ id: string; originKind: string }>;
 
-      const products = await workProductsByIssue(txDb, input.companyId, [input.sourceIssueId, ...current.map((row) => row.id)]);
+      await acquireDeliveryResidueMutationLocks(txDb, [
+        { companyId: input.companyId, issueId: input.sourceIssueId },
+        ...current.map((row) => ({ companyId: input.companyId, issueId: row.id })),
+      ]);
+
+      const candidateIds = new Set(current.map((row) => row.id));
+      const lockedIssues = await tx.select({
+        id: issues.id,
+        originKind: issues.originKind,
+        originId: issues.originId,
+        status: issues.status,
+        hiddenAt: issues.hiddenAt,
+      }).from(issues).where(and(
+        eq(issues.companyId, input.companyId),
+        inArray(issues.id, [input.sourceIssueId, ...candidateIds]),
+      )).orderBy(asc(issues.id)).for("update");
+      const lockedSource = lockedIssues.find((row) => row.id === input.sourceIssueId) ?? null;
+      if (!lockedSource) return [] as Array<{ id: string; originKind: string }>;
+      const residueKinds = new Set<string>(MERGED_DELIVERY_RESIDUE_ORIGIN_KINDS);
+      const lockedCurrent = lockedIssues.filter((row) => (
+        candidateIds.has(row.id)
+        && row.originKind !== null
+        && residueKinds.has(row.originKind)
+        && row.originId === input.sourceIssueId
+        && row.hiddenAt === null
+        && row.status !== "done"
+        && row.status !== "cancelled"
+      ));
+
+      const products = await workProductsByIssue(
+        txDb,
+        input.companyId,
+        [input.sourceIssueId, ...lockedCurrent.map((row) => row.id)],
+        true,
+      );
       const sourceReference = structuredPullRequestReference(products.get(input.sourceIssueId) ?? []);
       if (!sourceReference || !sameReference(sourceReference, input.reference)) {
         return [] as Array<{ id: string; originKind: string }>;
       }
-      const eligible = current.filter((row) => {
+      const eligible = lockedCurrent.filter((row) => {
         const residueProducts = products.get(row.id) ?? [];
         if (residueProducts.length === 0) return false;
         const residueReference = structuredPullRequestReference(residueProducts);
         return residueReference !== null && sameReference(residueReference, input.reference);
+      });
+      await options.afterEligibilityRevalidation?.({
+        companyId: input.companyId,
+        sourceIssueId: input.sourceIssueId,
+        activeResidueIssueIds: lockedCurrent.map((row) => row.id),
+        eligibleResidueIssueIds: eligible.map((row) => row.id),
       });
       if (eligible.length === 0) return [] as Array<{ id: string; originKind: string }>;
 
@@ -197,7 +258,7 @@ export function mergedDeliveryResidueService(db: Db, options: {
       return updated;
     });
     for (const publication of publications) publishActivity(publication);
-    return retired.length;
+    return { retired: retired.length, retry: false };
   }
 
   type LinkInput = {
@@ -207,9 +268,7 @@ export function mergedDeliveryResidueService(db: Db, options: {
     originKind: ResidueOriginKind;
   };
 
-  async function linkInStore(dbOrTx: Db, input: LinkInput, publications: ActivityPublication[]) {
-    if (input.residueIssueId === input.sourceIssueId) throw new Error("Delivery residue cannot link to itself");
-    await dbOrTx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`delivery-residue-link:${input.companyId}:${input.residueIssueId}`}, 0))`);
+  async function lockLinkIssues(dbOrTx: Db, input: LinkInput) {
     const rows = await dbOrTx.select({
       id: issues.id,
       originKind: issues.originKind,
@@ -217,14 +276,37 @@ export function mergedDeliveryResidueService(db: Db, options: {
     }).from(issues).where(and(
       eq(issues.companyId, input.companyId),
       inArray(issues.id, [input.sourceIssueId, input.residueIssueId]),
-    ));
+    )).orderBy(asc(issues.id)).for("update");
     if (rows.length !== 2) throw new Error("Delivery residue source or issue was not found");
+    return rows;
+  }
+
+  async function linkInStore(
+    dbOrTx: Db,
+    input: LinkInput,
+    publications: ActivityPublication[],
+    mutationLocksHeld = false,
+    lockedIssueRows?: Awaited<ReturnType<typeof lockLinkIssues>>,
+  ) {
+    if (input.residueIssueId === input.sourceIssueId) throw new Error("Delivery residue cannot link to itself");
+    if (!mutationLocksHeld) {
+      await acquireDeliveryResidueMutationLocks(dbOrTx, [
+        { companyId: input.companyId, issueId: input.sourceIssueId },
+        { companyId: input.companyId, issueId: input.residueIssueId },
+      ]);
+    }
+    const rows = lockedIssueRows ?? await lockLinkIssues(dbOrTx, input);
     const residue = rows.find((row) => row.id === input.residueIssueId)!;
     const alreadyLinked = residue.originKind === input.originKind && residue.originId === input.sourceIssueId;
     if (!alreadyLinked && (residue.originKind !== "manual" || residue.originId !== null)) {
       throw new Error("Delivery residue already has immutable origin provenance");
     }
-    const products = await workProductsByIssue(dbOrTx, input.companyId, [input.sourceIssueId, input.residueIssueId]);
+    const products = await workProductsByIssue(
+      dbOrTx,
+      input.companyId,
+      [input.sourceIssueId, input.residueIssueId],
+      true,
+    );
     const sourceReference = structuredPullRequestReference(products.get(input.sourceIssueId) ?? []);
     const residueReference = structuredPullRequestReference(products.get(input.residueIssueId) ?? []);
     if (!sourceReference || !residueReference || !sameReference(sourceReference, residueReference)) {
@@ -282,6 +364,17 @@ export function mergedDeliveryResidueService(db: Db, options: {
         if (input.workProduct.type !== "pull_request") {
           throw new Error("Delivery residue linkage requires a pull-request work product");
         }
+        await acquireDeliveryResidueMutationLocks(txDb, [
+          { companyId: input.companyId, issueId: input.sourceIssueId },
+          { companyId: input.companyId, issueId: input.residueIssueId },
+        ]);
+        const lockedIssueRows = await lockLinkIssues(txDb, input);
+        await workProductsByIssue(
+          txDb,
+          input.companyId,
+          [input.sourceIssueId, input.residueIssueId],
+          true,
+        );
         if (input.workProduct.isPrimary) {
           await tx.update(issueWorkProducts).set({ isPrimary: false, updatedAt: now() }).where(and(
             eq(issueWorkProducts.companyId, input.companyId),
@@ -295,7 +388,7 @@ export function mergedDeliveryResidueService(db: Db, options: {
           issueId: input.residueIssueId,
         }).returning().then((rows) => rows[0] ?? null);
         if (!product) throw new Error("Delivery residue work product could not be created");
-        const linked = await linkInStore(txDb, input, publications);
+        const linked = await linkInStore(txDb, input, publications, true, lockedIssueRows);
         return { product: toIssueWorkProduct(product), linked };
       });
       for (const publication of publications) publishActivity(publication);
@@ -303,6 +396,8 @@ export function mergedDeliveryResidueService(db: Db, options: {
     },
 
     async sweep(input: { limit?: number } = {}): Promise<MergedDeliveryResidueSweepResult> {
+      if (sweepInFlight) return sweepInFlight;
+      const run = (async (): Promise<MergedDeliveryResidueSweepResult> => {
       const configuredLimit = Number(input.limit ?? process.env.PAPERCLIP_MERGED_DELIVERY_RESIDUE_BATCH_SIZE ?? 100);
       const limit = Number.isFinite(configuredLimit) ? Math.max(1, Math.min(500, Math.trunc(configuredLimit))) : 100;
       const baseCondition = and(
@@ -367,14 +462,37 @@ export function mergedDeliveryResidueService(db: Db, options: {
         const products = await workProductsByIssue(db, group.companyId, [group.sourceIssueId]);
         const reference = structuredPullRequestReference(products.get(group.sourceIssueId) ?? []);
         if (!reference) continue;
+        const retryKey = `${group.companyId}:${group.sourceIssueId}:${referenceKey(reference)}`;
+        const retry = sourceRetries.get(retryKey);
+        if (retry && retry.retryAfterMs > now().getTime()) continue;
         checked += 1;
-        const retired = await consolidateSource({ ...group, reference });
-        if (retired > 0) {
+        const result = await consolidateSource({ ...group, reference });
+        if (result.retry) {
+          const attempts = (retry?.attempts ?? 0) + 1;
+          const delayMs = Math.min(
+            NON_MERGED_RETRY_MAX_MS,
+            NON_MERGED_RETRY_BASE_MS * (2 ** Math.min(attempts - 1, 10)),
+          );
+          setBoundedPullRequestCacheEntry(sourceRetries, retryKey, {
+            attempts,
+            retryAfterMs: now().getTime() + delayMs,
+          });
+        } else {
+          sourceRetries.delete(retryKey);
+        }
+        if (result.retired > 0) {
           mergedSources += 1;
-          retiredIssues += retired;
+          retiredIssues += result.retired;
         }
       }
       return { checked, candidates: candidates.length, mergedSources, retiredIssues };
+      })();
+      sweepInFlight = run;
+      try {
+        return await run;
+      } finally {
+        if (sweepInFlight === run) sweepInFlight = null;
+      }
     },
   };
 }

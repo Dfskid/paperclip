@@ -15,6 +15,10 @@ import {
   structuredPullRequestReference,
 } from "../services/merged-delivery-residue.js";
 import {
+  acquireDeliveryResidueMutationLocks,
+  workProductService,
+} from "../services/work-products.js";
+import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
@@ -296,6 +300,260 @@ describeEmbeddedPostgres("merged-delivery residue consolidation", () => {
       .resolves.toEqual([{ status: "cancelled" }]);
   });
 
+  it("coalesces overlapping sweep calls into one provider check", async () => {
+    const { companyId, sourceIssueId } = await seedCompanyAndSource();
+    await seedResidue(companyId, sourceIssueId);
+    let signalProviderStarted!: () => void;
+    let releaseProvider!: () => void;
+    const providerStarted = new Promise<void>((resolve) => { signalProviderStarted = resolve; });
+    const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve; });
+    const resolvePullRequestDetails = vi.fn(async () => {
+      signalProviderStarted();
+      await providerGate;
+      return {
+        ...mergedDetails(),
+        state: "open" as const,
+        repositoryId: null,
+        baseSha: null,
+        mergeCommitSha: null,
+        mergedAt: null,
+        providerSnapshotId: null,
+        observedAt: null,
+      };
+    });
+    const service = mergedDeliveryResidueService(db, { resolvePullRequestDetails });
+
+    const firstSweep = service.sweep();
+    await providerStarted;
+    const overlappingSweep = service.sweep();
+    releaseProvider();
+
+    const [firstResult, overlappingResult] = await Promise.all([firstSweep, overlappingSweep]);
+    expect(overlappingResult).toEqual(firstResult);
+    expect(resolvePullRequestDetails).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["open", "unknown"] as const)("bounds provider retries for a persistent %s source", async (state) => {
+    const { companyId, sourceIssueId } = await seedCompanyAndSource();
+    await seedResidue(companyId, sourceIssueId);
+    let currentTime = new Date("2026-08-11T14:00:00.000Z");
+    const resolvePullRequestDetails = vi.fn(async () => ({
+      ...mergedDetails(),
+      state,
+      repositoryId: null,
+      baseSha: null,
+      mergeCommitSha: null,
+      mergedAt: null,
+      providerSnapshotId: null,
+      observedAt: null,
+    }));
+    const service = mergedDeliveryResidueService(db, {
+      now: () => currentTime,
+      resolvePullRequestDetails,
+    });
+
+    await service.sweep();
+    await service.sweep();
+    await service.sweep();
+    expect(resolvePullRequestDetails).toHaveBeenCalledTimes(1);
+
+    currentTime = new Date(currentTime.getTime() + 60_000);
+    await service.sweep();
+    expect(resolvePullRequestDetails).toHaveBeenCalledTimes(2);
+  });
+
+  it("blocks an ordinary work-product mutation while the shared scope lock is held", async () => {
+    const { companyId, sourceIssueId } = await seedCompanyAndSource();
+    let signalHolderLocked!: () => void;
+    let releaseHolder!: () => void;
+    const holderLocked = new Promise<void>((resolve) => { signalHolderLocked = resolve; });
+    const holderGate = new Promise<void>((resolve) => { releaseHolder = resolve; });
+    const holder = db.transaction(async (tx) => {
+      await acquireDeliveryResidueMutationLocks(tx as unknown as typeof db, [{
+        companyId,
+        issueId: sourceIssueId,
+      }]);
+      signalHolderLocked();
+      await holderGate;
+    });
+    await holderLocked;
+
+    let signalOrdinaryLock!: () => void;
+    const ordinaryLock = new Promise<void>((resolve) => { signalOrdinaryLock = resolve; });
+    const mutation = workProductService(db, {
+      afterMutationLock: () => signalOrdinaryLock(),
+    }).createForIssue(sourceIssueId, companyId, {
+      type: "document",
+      provider: "test",
+      title: "Blocked ordinary mutation",
+      status: "open",
+    });
+    const acquiredWhileHeld = await Promise.race([
+      ordinaryLock.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 50)),
+    ]);
+    expect(acquiredWhileHeld).toBe(false);
+
+    releaseHolder();
+    await holder;
+    await expect(mutation).resolves.toMatchObject({ issueId: sourceIssueId });
+    await ordinaryLock;
+  });
+
+  it.each(["create", "update", "remove"] as const)(
+    "revalidates structured evidence after an ordinary %s mutation commits",
+    async (mutationKind) => {
+      const { companyId, sourceIssueId } = await seedCompanyAndSource();
+      const residueIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: residueIssueId,
+        companyId,
+        title: "Racing courier",
+        status: "todo",
+        originKind: "delivery_courier",
+        originId: sourceIssueId,
+        updatedAt: new Date("2026-08-11T10:00:00.000Z"),
+      });
+      const [residueProduct] = await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId: residueIssueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "paperclipai/paperclip#321",
+        title: "PR #321",
+        url: pullRequestUrl,
+        status: "open",
+      }).returning();
+
+      let signalProviderStarted!: () => void;
+      let releaseProvider!: () => void;
+      let signalWriterLocked!: () => void;
+      let releaseWriter!: () => void;
+      let signalEligibilityRevalidated!: () => void;
+      const providerStarted = new Promise<void>((resolve) => { signalProviderStarted = resolve; });
+      const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve; });
+      const writerLocked = new Promise<void>((resolve) => { signalWriterLocked = resolve; });
+      const writerGate = new Promise<void>((resolve) => { releaseWriter = resolve; });
+      const eligibilityRevalidated = new Promise<void>((resolve) => { signalEligibilityRevalidated = resolve; });
+      const service = mergedDeliveryResidueService(db, {
+        resolvePullRequestDetails: async () => {
+          signalProviderStarted();
+          await providerGate;
+          return mergedDetails();
+        },
+        afterEligibilityRevalidation: () => signalEligibilityRevalidated(),
+      });
+      const writer = workProductService(db, {
+        afterMutationLock: async ({ operation, issueId }) => {
+          expect(operation).toBe(mutationKind);
+          expect(issueId).toBe(residueIssueId);
+          signalWriterLocked();
+          await writerGate;
+        },
+      });
+
+      const sweep = service.sweep();
+      await providerStarted;
+      const mutation = mutationKind === "create"
+        ? writer.createForIssue(residueIssueId, companyId, {
+          type: "pull_request",
+          provider: "github",
+          externalId: "paperclipai/paperclip#322",
+          title: "PR #322",
+          url: "https://github.com/paperclipai/paperclip/pull/322",
+          status: "open",
+        })
+        : mutationKind === "update"
+          ? writer.update(residueProduct!.id, {
+            externalId: "paperclipai/paperclip#322",
+            url: "https://github.com/paperclipai/paperclip/pull/322",
+          })
+          : writer.remove(residueProduct!.id);
+      await writerLocked;
+      releaseProvider();
+      const revalidatedBeforeCommit = await Promise.race([
+        eligibilityRevalidated.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 50)),
+      ]);
+      expect(revalidatedBeforeCommit).toBe(false);
+
+      releaseWriter();
+      await mutation;
+      await sweep;
+      await eligibilityRevalidated;
+      await expect(db.select({ status: issues.status }).from(issues).where(eq(issues.id, residueIssueId)))
+        .resolves.toEqual([{ status: "todo" }]);
+      await expect(db.select().from(activityLog).where(eq(activityLog.action, "delivery.residue_consolidated")))
+        .resolves.toHaveLength(0);
+    },
+  );
+
+  it("revalidates active status after a concurrent issue-row update commits", async () => {
+    const { companyId, sourceIssueId } = await seedCompanyAndSource();
+    const residueIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: residueIssueId,
+      companyId,
+      title: "Status-racing courier",
+      status: "todo",
+      originKind: "delivery_courier",
+      originId: sourceIssueId,
+      updatedAt: new Date("2026-08-11T10:00:00.000Z"),
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId,
+      issueId: residueIssueId,
+      type: "pull_request",
+      provider: "github",
+      externalId: "paperclipai/paperclip#321",
+      title: "PR #321",
+      url: pullRequestUrl,
+      status: "open",
+    });
+    let signalProviderStarted!: () => void;
+    let releaseProvider!: () => void;
+    let signalStatusWritten!: () => void;
+    let releaseStatus!: () => void;
+    let signalEligibilityRevalidated!: () => void;
+    const providerStarted = new Promise<void>((resolve) => { signalProviderStarted = resolve; });
+    const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve; });
+    const statusWritten = new Promise<void>((resolve) => { signalStatusWritten = resolve; });
+    const statusGate = new Promise<void>((resolve) => { releaseStatus = resolve; });
+    const eligibilityRevalidated = new Promise<void>((resolve) => { signalEligibilityRevalidated = resolve; });
+    const service = mergedDeliveryResidueService(db, {
+      resolvePullRequestDetails: async () => {
+        signalProviderStarted();
+        await providerGate;
+        return mergedDetails();
+      },
+      afterEligibilityRevalidation: () => signalEligibilityRevalidated(),
+    });
+
+    const sweep = service.sweep();
+    await providerStarted;
+    const statusMutation = db.transaction(async (tx) => {
+      await tx.update(issues).set({ status: "done" }).where(eq(issues.id, residueIssueId));
+      signalStatusWritten();
+      await statusGate;
+    });
+    await statusWritten;
+    releaseProvider();
+    const revalidatedBeforeCommit = await Promise.race([
+      eligibilityRevalidated.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 50)),
+    ]);
+    expect(revalidatedBeforeCommit).toBe(false);
+
+    releaseStatus();
+    await statusMutation;
+    await sweep;
+    await eligibilityRevalidated;
+    await expect(db.select({ status: issues.status }).from(issues).where(eq(issues.id, residueIssueId)))
+      .resolves.toEqual([{ status: "done" }]);
+    await expect(db.select().from(activityLog).where(eq(activityLog.action, "delivery.residue_consolidated")))
+      .resolves.toHaveLength(0);
+  });
+
   it("revisits an earlier source within a bounded scan epoch while newer residue keeps arriving", async () => {
     const { companyId, sourceIssueId } = await seedCompanyAndSource();
     const oldResidueId = randomUUID();
@@ -308,7 +566,9 @@ describeEmbeddedPostgres("merged-delivery residue consolidation", () => {
       externalId: "paperclipai/paperclip#321", title: "PR #321", url: pullRequestUrl, status: "open",
     });
     let merged = false;
+    let currentTime = new Date("2026-08-11T14:00:00.000Z");
     const service = mergedDeliveryResidueService(db, {
+      now: () => currentTime,
       resolvePullRequestDetails: async () => merged
         ? mergedDetails()
         : { ...mergedDetails(), state: "open", repositoryId: null, baseSha: null, mergeCommitSha: null, mergedAt: null, providerSnapshotId: null, observedAt: null },
@@ -316,6 +576,7 @@ describeEmbeddedPostgres("merged-delivery residue consolidation", () => {
 
     await expect(service.sweep({ limit: 1 })).resolves.toMatchObject({ retiredIssues: 0 });
     merged = true;
+    currentTime = new Date(currentTime.getTime() + 60_000);
     for (let index = 0; index < 2; index += 1) {
       await db.insert(issues).values({
         id: randomUUID(), companyId, title: `Continuous arrival ${index}`, status: "todo",

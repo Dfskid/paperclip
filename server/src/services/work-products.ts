@@ -3,9 +3,14 @@ import type { Db } from "@paperclipai/db";
 import { issueWorkProducts } from "@paperclipai/db";
 import type { IssueWorkProduct } from "@paperclipai/shared";
 import { insertRowsInChunks } from "./batch-insert.js";
+import { acquireDeliveryResidueMutationLocks } from "./delivery-residue-mutation-lock.js";
 import type { ImportIssueWorkProductRow } from "./import-write-types.js";
 
 type IssueWorkProductRow = typeof issueWorkProducts.$inferSelect;
+type WorkProductUpdatePatch = Partial<Omit<
+  typeof issueWorkProducts.$inferInsert,
+  "id" | "companyId" | "issueId"
+>>;
 
 function toIssueWorkProduct(row: IssueWorkProductRow): IssueWorkProduct {
   return {
@@ -33,7 +38,28 @@ function toIssueWorkProduct(row: IssueWorkProductRow): IssueWorkProduct {
   };
 }
 
-export function workProductService(db: Db) {
+export type WorkProductMutationOperation = "create" | "update" | "remove";
+
+export type WorkProductServiceOptions = {
+  /** Test/diagnostic observer invoked only after the real transaction lock is held. */
+  afterMutationLock?: (input: {
+    operation: WorkProductMutationOperation;
+    companyId: string;
+    issueId: string;
+  }) => void | Promise<void>;
+};
+
+export function workProductService(db: Db, options: WorkProductServiceOptions = {}) {
+  async function lockMutation(
+    tx: Db,
+    operation: WorkProductMutationOperation,
+    companyId: string,
+    issueId: string,
+  ) {
+    await acquireDeliveryResidueMutationLocks(tx, [{ companyId, issueId }]);
+    await options.afterMutationLock?.({ operation, companyId, issueId });
+  }
+
   return {
     listForIssue: async (issueId: string) => {
       const rows = await db
@@ -55,6 +81,7 @@ export function workProductService(db: Db) {
 
     createForIssue: async (issueId: string, companyId: string, data: Omit<typeof issueWorkProducts.$inferInsert, "issueId" | "companyId">) => {
       const row = await db.transaction(async (tx) => {
+        await lockMutation(tx as unknown as Db, "create", companyId, issueId);
         if (data.isPrimary) {
           await tx
             .update(issueWorkProducts)
@@ -80,12 +107,20 @@ export function workProductService(db: Db) {
       return row ? toIssueWorkProduct(row) : null;
     },
 
-    update: async (id: string, patch: Partial<typeof issueWorkProducts.$inferInsert>) => {
+    update: async (id: string, patch: WorkProductUpdatePatch) => {
       const row = await db.transaction(async (tx) => {
-        const existing = await tx
+        let existing = await tx
           .select()
           .from(issueWorkProducts)
           .where(eq(issueWorkProducts.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (!existing) return null;
+        await lockMutation(tx as unknown as Db, "update", existing.companyId, existing.issueId);
+        existing = await tx
+          .select()
+          .from(issueWorkProducts)
+          .where(eq(issueWorkProducts.id, id))
+          .for("update")
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
 
@@ -159,14 +194,35 @@ export function workProductService(db: Db) {
     },
 
     remove: async (id: string) => {
-      const row = await db
-        .delete(issueWorkProducts)
-        .where(eq(issueWorkProducts.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const row = await db.transaction(async (tx) => {
+        let existing = await tx
+          .select()
+          .from(issueWorkProducts)
+          .where(eq(issueWorkProducts.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (!existing) return null;
+        await lockMutation(tx as unknown as Db, "remove", existing.companyId, existing.issueId);
+        existing = await tx
+          .select()
+          .from(issueWorkProducts)
+          .where(eq(issueWorkProducts.id, id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!existing) return null;
+        return await tx
+          .delete(issueWorkProducts)
+          .where(eq(issueWorkProducts.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      });
       return row ? toIssueWorkProduct(row) : null;
     },
   };
 }
 
 export { toIssueWorkProduct };
+export {
+  acquireDeliveryResidueMutationLocks,
+  deliveryResidueMutationLockKey,
+} from "./delivery-residue-mutation-lock.js";
+export type { DeliveryResidueMutationScope } from "./delivery-residue-mutation-lock.js";

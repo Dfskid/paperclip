@@ -1,5 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { attachmentArtifactWorkProductMetadataSchema } from "./work-product.js";
+import { ISSUE_ORIGIN_KINDS, type IssueOriginKind } from "../constants.js";
+import {
+  attachmentArtifactWorkProductMetadataSchema,
+  DELIVERY_RESIDUE_ORIGIN_KINDS,
+} from "./work-product.js";
+
+describe("delivery residue origin kinds", () => {
+  it("keeps every delivery residue kind in the canonical issue-origin contract", () => {
+    const deliveryKinds: readonly IssueOriginKind[] = DELIVERY_RESIDUE_ORIGIN_KINDS;
+
+    expect(ISSUE_ORIGIN_KINDS).toEqual(expect.arrayContaining([...deliveryKinds]));
+  });
+});
 
 describe("attachmentArtifactWorkProductMetadataSchema", () => {
   it("accepts the attachment-backed artifact metadata contract", () => {

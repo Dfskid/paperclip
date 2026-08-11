@@ -40,6 +40,7 @@ describe("workProductService", () => {
     const txInsert = vi.fn(() => ({ values: insertValues }));
 
     const tx = {
+      execute: vi.fn(async () => undefined),
       update: txUpdate,
       insert: txInsert,
     };
@@ -64,7 +65,10 @@ describe("workProductService", () => {
   it("uses a transaction when promoting an existing work product to primary", async () => {
     const existingRow = createWorkProductRow({ isPrimary: false });
 
-    const selectWhere = vi.fn(async () => [existingRow]);
+    const lockedSelect = vi.fn(async () => [existingRow]);
+    const selectWhere = vi.fn()
+      .mockResolvedValueOnce([existingRow])
+      .mockReturnValueOnce({ for: lockedSelect });
     const selectFrom = vi.fn(() => ({ where: selectWhere }));
     const txSelect = vi.fn(() => ({ from: selectFrom }));
 
@@ -76,6 +80,7 @@ describe("workProductService", () => {
     const txUpdate = vi.fn(() => ({ set: updateSet }));
 
     const tx = {
+      execute: vi.fn(async () => undefined),
       select: txSelect,
       update: txUpdate,
     };
@@ -88,7 +93,8 @@ describe("workProductService", () => {
     });
 
     expect(transaction).toHaveBeenCalledTimes(1);
-    expect(txSelect).toHaveBeenCalledTimes(1);
+    expect(txSelect).toHaveBeenCalledTimes(2);
+    expect(lockedSelect).toHaveBeenCalledWith("update");
     expect(txUpdate).toHaveBeenCalledTimes(2);
     expect(result?.reviewState).toBe("ready_for_review");
   });

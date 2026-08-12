@@ -56,6 +56,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     startedAt?: Date;
     parentId?: string | null;
     originKind?: string;
+    blockedTransitionAt?: Date | null;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -107,6 +108,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
       startedAt: opts?.startedAt ?? createdAt,
+      blockedTransitionAt: opts?.blockedTransitionAt ?? null,
       createdAt,
       updatedAt: createdAt,
     });
@@ -512,6 +514,46 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
     expect(review?.priority).toBe("medium");
     expect(hold.held).toBe(false);
+  });
+
+  it("suppresses the long-active trigger when the source was durably human-blocked", async () => {
+    // Regression for OWN-131: an issue that was explicitly blocked on a human
+    // for longer than the long-active threshold (e.g. waiting on a manual
+    // deploy) must not re-fire the long_active_duration review on every
+    // reconciliation tick, even after the status flaps back to in_progress.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 36 * 60 * 60 * 1000),
+      blockedTransitionAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still fires the long-active trigger when the blocked transition is recent", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 36 * 60 * 60 * 1000),
+      blockedTransitionAt: new Date(now.getTime() - 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {

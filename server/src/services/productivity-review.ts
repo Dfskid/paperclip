@@ -553,9 +553,14 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const elapsedMs = sourceIssue.status === "in_progress" && activeStartedAt
       ? Math.max(0, now.getTime() - activeStartedAt.getTime())
       : null;
+    const blockedElapsedMs = sourceIssue.blockedTransitionAt
+      ? Math.max(0, now.getTime() - sourceIssue.blockedTransitionAt.getTime())
+      : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    const longActive = elapsedMs !== null
+      && elapsedMs >= thresholds.longActiveMs
+      && !(blockedElapsedMs !== null && blockedElapsedMs >= thresholds.longActiveMs);
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||

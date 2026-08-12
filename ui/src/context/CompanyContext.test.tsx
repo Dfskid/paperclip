@@ -40,6 +40,7 @@ function makeCompany(id: string): Company {
     spentMonthlyCents: 0,
     attachmentMaxBytes: 10 * 1024 * 1024,
     defaultResponsibleUserId: null,
+    productivityReviewResolvedSnoozeMs: null,
     requireBoardApprovalForNewAgents: false,
     interactionResolverGovernance: {},
     feedbackDataSharingEnabled: false,

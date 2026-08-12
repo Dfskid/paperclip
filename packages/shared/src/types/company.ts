@@ -27,6 +27,7 @@ export interface Company {
   spentMonthlyCents: number;
   attachmentMaxBytes: number;
   defaultResponsibleUserId: string | null;
+  productivityReviewResolvedSnoozeMs: number | null;
   requireBoardApprovalForNewAgents: boolean;
   interactionResolverGovernance: InteractionResolverGovernance;
   feedbackDataSharingEnabled: boolean;

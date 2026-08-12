@@ -8,6 +8,7 @@ import {
 const logoAssetIdSchema = z.string().uuid().nullable().optional();
 const brandColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/).nullable().optional();
 const feedbackDataSharingTermsVersionSchema = z.string().min(1).nullable().optional();
+const productivityReviewResolvedSnoozeMsSchema = z.number().int().positive().nullable().optional();
 const attachmentMaxBytesSchema = z
   .number()
   .int()
@@ -33,6 +34,7 @@ export const createCompanySchema = z.object({
   budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
   attachmentMaxBytes: attachmentMaxBytesSchema.optional(),
   defaultResponsibleUserId: z.string().min(1).nullable().optional(),
+  productivityReviewResolvedSnoozeMs: productivityReviewResolvedSnoozeMsSchema,
 });
 
 export type CreateCompany = z.infer<typeof createCompanySchema>;

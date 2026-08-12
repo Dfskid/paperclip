@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import type { IssueUnblockDescriptor } from "@paperclipai/shared";
 import {
   activityLog,
   agents,
@@ -58,6 +59,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     parentId?: string | null;
     originKind?: string;
     blockedTransitionAt?: Date | null;
+    unblockDescriptor?: IssueUnblockDescriptor | null;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -110,6 +112,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       identifier: `${issuePrefix}-1`,
       startedAt: opts?.startedAt ?? createdAt,
       blockedTransitionAt: opts?.blockedTransitionAt ?? null,
+      unblockDescriptor: opts?.unblockDescriptor ?? null,
       createdAt,
       updatedAt: createdAt,
     });
@@ -803,6 +806,46 @@ describeEmbeddedPostgres("productivity review service", () => {
 
     expect(result.created).toBe(0);
     expect(result.skipped).toBe(1);
+  });
+
+  it("does not suppress an active issue because of a stale unblockDescriptor (OWN-131)", async () => {
+    // An unblockDescriptor is valid only while an issue is blocked. If stale
+    // data remains on an active row, it must not hide a real long-active signal.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 36 * 60 * 60 * 1000),
+      unblockDescriptor: { owner: { userId: "steve" }, action: "Manual deploy to production" },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("fires the long-active trigger when unblockDescriptor is absent (OWN-131)", async () => {
+    // When no unblockDescriptor is set, long_active_duration fires normally
+    // even if the issue has been running for longer than the threshold.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 36 * 60 * 60 * 1000),
+      unblockDescriptor: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {

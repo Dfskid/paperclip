@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -8,6 +8,7 @@ import {
   costEvents,
   heartbeatRuns,
   issueComments,
+  issueRelations,
   issues,
   projects,
 } from "@paperclipai/db";
@@ -557,10 +558,36 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       ? Math.max(0, now.getTime() - sourceIssue.blockedTransitionAt.getTime())
       : null;
 
+    // OWN-131: An issue that is durably blocked (has unresolved blocking
+    // relations -- e.g. waiting on a deploy or another issue) should not
+    // fire the long_active_duration trigger even when the status has flapped
+    // back to in_progress and cleared blockedTransitionAt. Query the blocking
+    // graph directly for any unresolved blockers.
+    const hasUnresolvedBlockerRelation = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs
+      && !(blockedElapsedMs !== null && blockedElapsedMs >= thresholds.longActiveMs)
+      ? await db
+          .select({ blockerId: issueRelations.issueId })
+          .from(issueRelations)
+          .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+          .where(
+            and(
+              eq(issueRelations.companyId, sourceIssue.companyId),
+              eq(issueRelations.relatedIssueId, sourceIssue.id),
+              eq(issueRelations.type, "blocks"),
+              ne(issues.status, "done"),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows.length > 0)
+      : false;
+
+    const isEffectivelyBlocked = (blockedElapsedMs !== null && blockedElapsedMs >= thresholds.longActiveMs)
+      || hasUnresolvedBlockerRelation;
+
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     const longActive = elapsedMs !== null
       && elapsedMs >= thresholds.longActiveMs
-      && !(blockedElapsedMs !== null && blockedElapsedMs >= thresholds.longActiveMs);
+      && !isEffectivelyBlocked;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||

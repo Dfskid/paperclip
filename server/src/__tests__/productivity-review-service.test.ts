@@ -8,6 +8,7 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueRelations,
   issues,
 } from "@paperclipai/db";
 import {
@@ -576,6 +577,232 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("suppresses the long-active trigger when the issue has an unresolved explicit blocker relation (OWN-131)", async () => {
+    // Regression for OWN-131: an issue with in_progress status but an
+    // unresolved blocker relation must not fire long_active_duration even
+    // though blockedTransitionAt is null (status never formally transitioned
+    // to blocked).
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 36 * 60 * 60 * 1000),
+    });
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId: seeded.companyId,
+      title: "Deploy to production",
+      status: "in_progress",
+      priority: "high",
+      issueNumber: 100,
+      identifier: `${seeded.issuePrefix}-100`,
+      createdAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+    });
+    await db.insert(issueRelations).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: seeded.issueId,
+      type: "blocks",
+      createdAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("fires the long-active trigger when the blocker is done and no other blockers remain (OWN-131)", async () => {
+    // When a blocker is complete (status=done), the issue is no longer
+    // durably blocked and long_active_duration should fire normally.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 36 * 60 * 60 * 1000),
+    });
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId: seeded.companyId,
+      title: "Completed deploy",
+      status: "done",
+      priority: "high",
+      issueNumber: 100,
+      identifier: `${seeded.issuePrefix}-100`,
+      createdAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 12 * 60 * 60 * 1000),
+    });
+    await db.insert(issueRelations).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: seeded.issueId,
+      type: "blocks",
+      createdAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("suppresses the long-active trigger when both blockedTransitionAt and blocker relation exist (OWN-131)", async () => {
+    // Even when both forms of blocked signal are present, it should suppress.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 36 * 60 * 60 * 1000),
+      blockedTransitionAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+    });
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId: seeded.companyId,
+      title: "Deploy to production",
+      status: "in_progress",
+      priority: "high",
+      issueNumber: 100,
+      identifier: `${seeded.issuePrefix}-100`,
+      createdAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+    });
+    await db.insert(issueRelations).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: seeded.issueId,
+      type: "blocks",
+      createdAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+  });
+
+  it("suppresses the long-active trigger when the issue has multiple blockers and only some are done (OWN-131)", async () => {
+    // Partial blocker resolution should still suppress: if any blocker
+    // remains unresolved, the issue is durably blocked.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 36 * 60 * 60 * 1000),
+    });
+    const doneBlockerId = randomUUID();
+    const unresolvedBlockerId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: doneBlockerId,
+        companyId: seeded.companyId,
+        title: "PR approved",
+        status: "done",
+        priority: "high",
+        issueNumber: 100,
+        identifier: `${seeded.issuePrefix}-100`,
+        createdAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+        updatedAt: new Date(now.getTime() - 12 * 60 * 60 * 1000),
+      },
+      {
+        id: unresolvedBlockerId,
+        companyId: seeded.companyId,
+        title: "Deploy to production",
+        status: "in_progress",
+        priority: "high",
+        issueNumber: 101,
+        identifier: `${seeded.issuePrefix}-101`,
+        createdAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+        updatedAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+      },
+    ]);
+    await db.insert(issueRelations).values([
+      {
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        issueId: doneBlockerId,
+        relatedIssueId: seeded.issueId,
+        type: "blocks",
+        createdAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+        updatedAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+      },
+      {
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        issueId: unresolvedBlockerId,
+        relatedIssueId: seeded.issueId,
+        type: "blocks",
+        createdAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+        updatedAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+      },
+    ]);
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+  });
+
+  it("suppresses the long-active trigger when the blocker is cancelled (OWN-131)", async () => {
+    // A cancelled blocker does NOT resolve the blocking relation; the
+    // issue is still effectively blocked until the relation is cleared.
+    // This matches the existing `listUnresolvedBlockerIssueIds` behaviour
+    // where cancelled blockers remain unresolved.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 36 * 60 * 60 * 1000),
+    });
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId: seeded.companyId,
+      title: "Cancelled blocker",
+      status: "cancelled",
+      priority: "high",
+      issueNumber: 100,
+      identifier: `${seeded.issuePrefix}-100`,
+      createdAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 12 * 60 * 60 * 1000),
+    });
+    await db.insert(issueRelations).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: seeded.issueId,
+      type: "blocks",
+      createdAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 48 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
   });
 
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {

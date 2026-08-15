@@ -6677,6 +6677,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
   };
   async function acknowledgeRunFinalizationReliably(runId: string) {
+    await executionFences.markRunFinalizerCompleted(runId);
     let lastError: unknown = null;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
@@ -10678,7 +10679,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: now,
         error: null,
       });
-      await acknowledgeRunFinalizationReliably(interrupted.id);
       interrupted = await classifyAndPersistRunLiveness(interrupted, parseObject(interrupted.resultJson)) ?? interrupted;
 
       await releaseEnvironmentLeasesForRun({
@@ -10689,12 +10689,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         failureReason: interrupted.error ?? undefined,
       });
 
-      const retry = agent.executionFenceId
-        ? null
-        : await enqueueProcessLossRetry(interrupted, agent, now);
+      const currentAgent = await getAgent(interrupted.agentId);
+      let retry: typeof heartbeatRuns.$inferSelect | null = null;
+      if (currentAgent && !currentAgent.executionFenceId) {
+        try {
+          retry = await enqueueProcessLossRetry(interrupted, currentAgent, now);
+        } catch (error) {
+          if (!isAgentExecutionFenceError(error)) throw error;
+        }
+      }
       if (!retry) {
         await releaseIssueExecutionAndPromote(interrupted, {
-          suppressImmediateRecovery: Boolean(agent.executionFenceId),
+          suppressImmediateRecovery: true,
         });
       } else {
         retryRunIds.push(retry.id);
@@ -10716,6 +10722,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(run.agentId, "interrupted", message, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
+      await acknowledgeRunFinalizationReliably(interrupted.id);
       interruptedRunIds.push(interrupted.id);
     }
 
@@ -13188,6 +13195,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(
         and(
           isNotNull(heartbeatRuns.startedAt),
+          isNotNull(heartbeatRuns.executionFinalizerCompletedAt),
           isNull(heartbeatRuns.executionFinalizedAt),
           notInArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
         ),
@@ -16435,6 +16443,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             failureReason: latestRun?.error ?? undefined,
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+            await releaseIssueExecutionAndPromote(latestRun, {
+              suppressImmediateRecovery: true,
+            }).catch((releaseError) => {
+              logger.error(
+                { err: releaseError, runId: run.id },
+                "failed to release issue execution during terminal run cleanup",
+              );
+            });
+          }
           if (runScratch && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
             const scratchForCleanup = runScratch;
             let scratchCleanup: Awaited<ReturnType<typeof cleanupHeartbeatRunScratch>> | null = null;
@@ -16617,6 +16635,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : candidateIssues[0]) ?? null;
 
       if (!issue) return null;
+      if (issue.executionRunId !== run.id && issue.checkoutRunId !== run.id) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
 
       // Workspace-validation recovery: if the finalizing run failed workspace

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -461,6 +461,24 @@ export function agentService(db: Db) {
     });
   }
 
+  function assertAgentExecutionFenceInactive(
+    agent: Pick<typeof agents.$inferSelect, "id" | "executionFenceId">,
+    operation: string,
+  ) {
+    if (!agent.executionFenceId) return;
+    throw conflict(`Cannot ${operation} while the agent has an active execution fence`, {
+      code: "agent_execution_fenced",
+      agentId: agent.id,
+      fenceId: agent.executionFenceId,
+    });
+  }
+
+  async function resolveLostStatusMutation(id: string, operation: string) {
+    const current = await getById(id);
+    if (current) assertAgentExecutionFenceInactive(current, operation);
+    return null;
+  }
+
   async function updateAgent(
     id: string,
     data: Partial<typeof agents.$inferInsert>,
@@ -468,6 +486,10 @@ export function agentService(db: Db) {
   ) {
     const existing = await getById(id);
     if (!existing) return null;
+
+    if (Object.prototype.hasOwnProperty.call(data, "status")) {
+      assertAgentExecutionFenceInactive(existing, "change agent status");
+    }
 
     if (existing.status === "terminated" && data.status && data.status !== "terminated") {
       throw conflict("Terminated agents cannot be resumed");
@@ -531,13 +553,17 @@ export function agentService(db: Db) {
 
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
+      const mutatesStatus = Object.prototype.hasOwnProperty.call(normalizedPatch, "status");
       const updated = await tx
         .update(agents)
         .set({ ...normalizedPatch, updatedAt: new Date() })
-        .where(eq(agents.id, id))
+        .where(mutatesStatus ? and(eq(agents.id, id), isNull(agents.executionFenceId)) : eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
-      if (!updated) return null;
+      if (!updated) {
+        if (mutatesStatus) return resolveLostStatusMutation(id, "change agent status");
+        return null;
+      }
 
       if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
         await syncAgentSecretBindings(updated, txDb);
@@ -635,6 +661,7 @@ export function agentService(db: Db) {
     pause: async (id: string, reason: "manual" | "budget" | "system" = "manual") => {
       const existing = await getById(id);
       if (!existing) return null;
+      assertAgentExecutionFenceInactive(existing, "pause agent");
       if (existing.status === "terminated") throw conflict("Cannot pause terminated agent");
 
       const updated = await db
@@ -646,15 +673,16 @@ export function agentService(db: Db) {
           errorReason: null,
           updatedAt: new Date(),
         })
-        .where(eq(agents.id, id))
+        .where(and(eq(agents.id, id), isNull(agents.executionFenceId)))
         .returning()
         .then((rows) => rows[0] ?? null);
-      return updated ? getById(updated.id) : null;
+      return updated ? getById(updated.id) : resolveLostStatusMutation(id, "pause agent");
     },
 
     resume: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
+      assertAgentExecutionFenceInactive(existing, "resume agent");
       if (existing.status === "terminated") throw conflict("Cannot resume terminated agent");
       if (existing.status === "pending_approval") {
         throw conflict("Pending approval agents cannot be resumed");
@@ -669,15 +697,16 @@ export function agentService(db: Db) {
           errorReason: null,
           updatedAt: new Date(),
         })
-        .where(eq(agents.id, id))
+        .where(and(eq(agents.id, id), isNull(agents.executionFenceId)))
         .returning()
         .then((rows) => rows[0] ?? null);
-      return updated ? getById(updated.id) : null;
+      return updated ? getById(updated.id) : resolveLostStatusMutation(id, "resume agent");
     },
 
     clearError: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
+      assertAgentExecutionFenceInactive(existing, "clear agent error");
       if (existing.status === "terminated") throw conflict("Cannot clear error on terminated agent");
       if (existing.status === "pending_approval") {
         throw conflict("Pending approval agents cannot have errors cleared");
@@ -695,11 +724,12 @@ export function agentService(db: Db) {
           errorReason: null,
           updatedAt: new Date(),
         })
-        .where(and(eq(agents.id, id), eq(agents.status, "error")))
+        .where(and(eq(agents.id, id), eq(agents.status, "error"), isNull(agents.executionFenceId)))
         .returning()
         .then((rows) => rows[0] ?? null);
 
       if (!updated) {
+        await resolveLostStatusMutation(id, "clear agent error");
         throw conflict("Only agents in error status can have their error cleared");
       }
       return getById(updated.id);
@@ -708,8 +738,9 @@ export function agentService(db: Db) {
     terminate: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
+      assertAgentExecutionFenceInactive(existing, "terminate agent");
 
-      await db
+      const updated = await db
         .update(agents)
         .set({
           status: "terminated",
@@ -718,7 +749,11 @@ export function agentService(db: Db) {
           errorReason: null,
           updatedAt: new Date(),
         })
-        .where(eq(agents.id, id));
+        .where(and(eq(agents.id, id), isNull(agents.executionFenceId)))
+        .returning({ id: agents.id })
+        .then((rows) => rows[0] ?? null);
+
+      if (!updated) return resolveLostStatusMutation(id, "terminate agent");
 
       await db
         .update(agentApiKeys)
@@ -731,6 +766,7 @@ export function agentService(db: Db) {
     remove: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
+      assertAgentExecutionFenceInactive(existing, "delete agent");
       const builtInMarker = readBuiltInAgentMarker(existing.metadata);
       if (builtInMarker) {
         throw conflict("Built-in agents cannot be deleted; pause them instead", {

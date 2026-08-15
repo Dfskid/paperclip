@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -6676,6 +6676,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return runningProcesses.has(id) || activeRunExecutions.has(id);
     },
   };
+  async function acknowledgeRunFinalizationReliably(runId: string) {
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        return await executionFences.acknowledgeRunFinalization(runId);
+      } catch (error) {
+        lastError = error;
+        if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 25));
+      }
+    }
+    throw lastError;
+  }
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
   };
@@ -10666,6 +10678,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: now,
         error: null,
       });
+      await acknowledgeRunFinalizationReliably(interrupted.id);
       interrupted = await classifyAndPersistRunLiveness(interrupted, parseObject(interrupted.resultJson)) ?? interrupted;
 
       await releaseEnvironmentLeasesForRun({
@@ -10703,9 +10716,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(run.agentId, "interrupted", message, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
-      if (agent.executionFenceId) {
-        await executionFences.acknowledgeRunFinalization(interrupted.id);
-      }
       interruptedRunIds.push(interrupted.id);
     }
 
@@ -13172,6 +13182,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
+    const missedFinalizations = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          isNotNull(heartbeatRuns.startedAt),
+          isNull(heartbeatRuns.executionFinalizedAt),
+          notInArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+        ),
+      );
+    for (const { id } of missedFinalizations) {
+      if (liveRunExecutions.has(id)) continue;
+      await acknowledgeRunFinalizationReliably(id).catch((error) => {
+        logger.warn(
+          { err: error, runId: id },
+          "deferred reconciliation could not acknowledge terminal run finalization",
+        );
+      });
+    }
+
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
       .select({
@@ -13357,7 +13387,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await startNextQueuedRunForAgent(run.agentId);
       } finally {
         runningProcesses.delete(run.id);
-        await executionFences.acknowledgeRunFinalization(run.id);
+        await acknowledgeRunFinalizationReliably(run.id);
       }
       reaped.push(run.id);
     }
@@ -16461,7 +16491,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           try {
             await startNextQueuedRunForAgent(run.agentId);
           } finally {
-            await executionFences.acknowledgeRunFinalization(run.id).catch((error) => {
+            await acknowledgeRunFinalizationReliably(run.id).catch((error) => {
               logger.error(
                 { err: error, runId: run.id, agentId: run.agentId },
                 "failed to acknowledge terminal heartbeat execution finalization",
@@ -18678,6 +18708,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     });
     await startNextQueuedRunForAgent(run.agentId);
+    if (cancelled?.startedAt && !liveRunExecutions.has(run.id)) {
+      await acknowledgeRunFinalizationReliably(run.id);
+    }
     return cancelled;
   }
 
@@ -18729,6 +18762,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
       await releaseIssueExecutionAndPromote(run);
+      if (run.startedAt && !liveRunExecutions.has(run.id)) {
+        await acknowledgeRunFinalizationReliably(run.id);
+      }
     }
 
     return runs.length;
@@ -18804,7 +18840,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : await listProjectScopedRunIds(scope.companyId, scope.scopeId);
 
     for (const runId of runIds) {
-      await cancelRunInternal(runId, "Cancelled due to budget pause");
+      const run = await getRun(runId);
+      if (!run) continue;
+      const agent = await getAgent(run.agentId);
+      if (agent?.executionFenceId) continue;
+      try {
+        await cancelRunInternal(runId, "Cancelled due to budget pause");
+      } catch (error) {
+        if (isAgentExecutionFenceError(error)) continue;
+        throw error;
+      }
     }
 
     await cancelPendingWakeupsForBudgetScope(scope);

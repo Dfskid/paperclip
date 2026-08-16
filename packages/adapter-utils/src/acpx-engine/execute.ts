@@ -3342,6 +3342,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       let handle = cached?.handle ?? null;
       let resumedSession = Boolean(handle ?? resumeSessionId);
       let clearSession = false;
+      let processOwnership: AdapterExecutionResult["processOwnership"];
 
       try {
         if (!handle) {
@@ -3657,6 +3658,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               lastUsedAt: now(),
             };
             warmHandles.set(prepared.sessionKey, entry);
+            processOwnership = "retained_runtime";
             scheduleIdleHandleCleanup({
               handles: warmHandles,
               key: prepared.sessionKey,
@@ -3721,6 +3723,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ...billingFields,
           ...referencedProjectStagingFailuresField,
           model: prepared.requestedModel || null,
+          ...(processOwnership ? { processOwnership } : {}),
           ...(turnUsage.usage ? { usage: turnUsage.usage, usageBasis: "per_run" as const } : {}),
           costUsd: turnUsage.costUsd,
           resultJson: {

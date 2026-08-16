@@ -398,6 +398,7 @@ describe("shared ACPX engine runtime behavior", () => {
     } as never);
 
     expect(first.exitCode).toBe(0);
+    expect(first.processOwnership).toBe("retained_runtime");
     expect(firstOnSpawn).toHaveBeenCalledOnce();
     expect(turnStartedBeforeProcessIdentity).toBe(false);
 
@@ -419,6 +420,7 @@ describe("shared ACPX engine runtime behavior", () => {
     } as never);
 
     expect(second.exitCode).toBe(0);
+    expect(second.processOwnership).toBe("retained_runtime");
     expect(runtimeCreateCount).toBe(1);
     expect(secondOnSpawn).toHaveBeenCalledOnce();
     expect(turnStartedBeforeProcessIdentity).toBe(false);

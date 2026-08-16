@@ -27,6 +27,7 @@ import {
   createLocalServiceKey,
   findLocalServiceRegistryRecordByRuntimeServiceId,
   findAdoptableLocalService,
+  isPidAlive,
   isLocalServiceProcessInWorkspace,
   readLocalServiceProcessCwd,
   readLocalServicePortOwner,
@@ -5267,7 +5268,11 @@ export async function releaseTerminalRuntimeServicesForRun(db: Db, runId: string
           `Cannot recover ephemeral runtime service ${row.id}: invalid local process reference`,
         );
       }
-      await terminateLocalService({ pid, processGroupId: null });
+      if (isPidAlive(pid)) {
+        throw new Error(
+          `Cannot recover ephemeral runtime service ${row.id}: live process has no verified registry identity`,
+        );
+      }
     }
 
     const now = new Date();

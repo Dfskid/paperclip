@@ -6727,6 +6727,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await persistFinalizationStepReliably(() => executionFences.markRunFinalizerCompleted(runId));
     return acknowledgeCompletedRunFinalizationReliably(runId);
   }
+  async function reconcileClaimedWakeupForTerminalRun(
+    run: typeof heartbeatRuns.$inferSelect,
+  ) {
+    if (!run.wakeupRequestId || !isHeartbeatRunTerminalStatus(run.status)) return;
+    const expectedWakeupStatus = run.status === "succeeded" ? "completed" : run.status;
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: expectedWakeupStatus,
+        finishedAt: run.finishedAt ?? new Date(),
+        error: run.error,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(agentWakeupRequests.id, run.wakeupRequestId),
+          eq(agentWakeupRequests.agentId, run.agentId),
+          eq(agentWakeupRequests.runId, run.id),
+          eq(agentWakeupRequests.status, "claimed"),
+        ),
+      );
+  }
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
   };
@@ -13344,7 +13366,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // fence permanently blocked after a transient DB or wakeup-finalization
     // failure. Never race a live in-process finally path.
     const missedFinalizers = await db
-      .select({ id: heartbeatRuns.id })
+      .select()
       .from(heartbeatRuns)
       .where(
         and(
@@ -13355,11 +13377,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           isNull(heartbeatRuns.executionFinalizedAt),
         ),
       );
-    for (const { id } of missedFinalizers) {
-      if (liveRunExecutions.has(id)) continue;
-      await acknowledgeRunFinalizationReliably(id).catch((error) => {
+    for (const run of missedFinalizers) {
+      if (liveRunExecutions.has(run.id)) continue;
+      await reconcileClaimedWakeupForTerminalRun(run);
+      await acknowledgeRunFinalizationReliably(run.id).catch((error) => {
         logger.warn(
-          { err: error, runId: id },
+          { err: error, runId: run.id },
           "deferred reconciliation could not complete terminal run finalization",
         );
       });

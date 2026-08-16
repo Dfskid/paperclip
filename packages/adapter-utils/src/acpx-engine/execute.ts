@@ -2723,7 +2723,7 @@ async function cleanupIdleHandles(input: {
       key,
       entry,
       reason: "paperclip idle cleanup",
-      suppressCloseErrors: false,
+      suppressCloseErrors: true,
     });
   }
 }

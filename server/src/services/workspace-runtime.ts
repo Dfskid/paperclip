@@ -40,6 +40,7 @@ import { workspaceOperationService, type WorkspaceOperationRecorder } from "./wo
 import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
+import { readProcessStartedAt } from "./hot-restart.js";
 import {
   cleanupWorktreeInstanceArtifacts,
   deriveWorktreeInstanceId,
@@ -4511,6 +4512,9 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       runtimeServiceId: record.id,
       reuseKey: input.reuseKey,
       startedAt: record.startedAt,
+      processStartedAt: child.pid
+        ? await readProcessStartedAt(child.pid).catch(() => null)
+        : null,
       lastSeenAt: record.lastUsedAt,
       metadata: {
         projectId: record.projectId,
@@ -5254,6 +5258,7 @@ export async function releaseTerminalRuntimeServicesForRun(db: Db, runId: string
     const registryRecord = await findLocalServiceRegistryRecordByRuntimeServiceId({
       runtimeServiceId: row.id,
       profileKind: "workspace-runtime",
+      requireExactProcessIdentity: true,
     });
     if (registryRecord) {
       await terminateLocalService({

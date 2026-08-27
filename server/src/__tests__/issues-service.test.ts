@@ -3910,6 +3910,52 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(blockedRelations.blockedBy.map((relation) => relation.id)).toEqual([blockerId]);
   });
 
+  it.each(["backlog", "todo", "in_progress", "in_review", "done", "cancelled"] as const)(
+    "clears blockedTransitionAt when blocked work transitions to %s",
+    async (status) => {
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      const issueId = randomUUID();
+      const blockedAt = new Date("2026-08-12T12:00:00.000Z");
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Resumable blocked work",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+        blockedTransitionAt: blockedAt,
+        unblockDescriptor: { owner: "board", action: "Resume the work" },
+      });
+
+      await svc.update(issueId, { status });
+
+      const [updated] = await db
+        .select({ blockedTransitionAt: issues.blockedTransitionAt, unblockDescriptor: issues.unblockDescriptor })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(updated).toEqual({ blockedTransitionAt: null, unblockDescriptor: null });
+    },
+  );
+
   it("returns blocked-by summaries on newly created issues", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({

@@ -243,7 +243,10 @@ export function createSensitiveTextStreamRedactor(options: {
     if (lastNewlineIndex >= 0) {
       const completeLines = combined.slice(0, lastNewlineIndex + 1);
       pending = combined.slice(lastNewlineIndex + 1);
-      frames.push(options.sanitize(completeLines));
+      // Secret redaction is an invariant of this stream boundary, not a
+      // responsibility callers can accidentally omit from their own framing
+      // sanitizer (for example, username masking or log-size compaction).
+      frames.push(options.sanitize(redactSensitiveText(completeLines)));
     } else {
       pending = combined;
     }
@@ -270,7 +273,7 @@ export function createSensitiveTextStreamRedactor(options: {
     if (maybeContainsSecretText(finalFrame) && secretSanitized === finalFrame) {
       return [SENSITIVE_STREAM_TAIL_MARKER];
     }
-    return [options.sanitize(finalFrame)];
+    return [options.sanitize(secretSanitized)];
   };
 
   return { push, flush };

@@ -206,6 +206,25 @@ describe("redaction", () => {
     }
   });
 
+  it("applies credential redaction before a caller-provided frame sanitizer", () => {
+    const completeCredential = "complete-sensitive-value-0123456789";
+    const complete = createSensitiveTextStreamRedactor({ sanitize: (frame) => frame });
+    const completeOutput = complete
+      .push(`adapter apiKey: \"${completeCredential}\"\n`)
+      .join("");
+
+    expect(completeOutput).toContain(REDACTED_EVENT_VALUE);
+    expect(completeOutput).not.toContain(completeCredential);
+
+    const finalCredential = "final-sensitive-value-0123456789";
+    const unterminated = createSensitiveTextStreamRedactor({ sanitize: (frame) => frame });
+    expect(unterminated.push(`adapter apiKey: \"${finalCredential}\"`)).toEqual([]);
+    const finalOutput = unterminated.flush().join("");
+
+    expect(finalOutput).toContain(REDACTED_EVENT_VALUE);
+    expect(finalOutput).not.toContain(finalCredential);
+  });
+
   it("fails closed for unterminated or oversized sensitive log frames", () => {
     const credentialPrefix = "split-sensitive-value-";
     const unterminated = createSensitiveTextStreamRedactor({ sanitize: redactSensitiveText });
